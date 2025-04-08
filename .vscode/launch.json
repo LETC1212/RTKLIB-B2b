@@ -1,0 +1,472 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "rtppp-linux-gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_default.conf","-nc"],
+            // "args": ["-o","${workspaceFolder}/conf/rtkrcv.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "replayppp-linux-gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtppp",
+            // "args": ["-o","${workspaceFolder}/conf/geo_Replay.conf","-nc"],
+            "args": ["-o","${workspaceFolder}/conf/geo_CNES_Replay_PTBB.conf","-nc"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "postppp-linux-gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_post_float.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "rtcmppp-linux-gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_post_rtcm.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "pppb2b",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_rtkpost_LB2b1129.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Debug_HK_B2b",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_rtkpost_DebugHK.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Debug_HK_WUM",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/geo_rtkpost_DebugHK_SP3.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "Debug_rtB2b_unicore",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtppp",
+            "args": ["-o","${workspaceFolder}/conf/rtB2b250224_unicore.conf","-nc","-t","22"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "UnixDebug_rtB2b_sino",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtppp",
+            "args": ["-o","${workspaceFolder}/conf/rtB2b250223_sino.conf","-nc","-t","22"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "WinDebug_rtB2b_sino",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtppp.exe",
+            "args": ["-o","${workspaceFolder}/conf/rtB2b250227_sino.conf","-nc","-t","22"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "Debug_postB2b_unicore",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/postB2b250223_unicore.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "UnixDebug_postB2b_sino",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/postB2b250223_sino.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "UnixDebug_postB2b_sino_wuh2_354",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/postB2b24354_unicore_wuh2.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "UnixDebug_postB2b_unicore_25067",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/postB2b25067_unicore_PTGG.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "UnixDebug_postWUM_unicore_25066",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp",
+            "args": ["-o","${workspaceFolder}/conf/postWUM25066_unicore_whigg.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+
+        {
+            "name": "WinDebug_postB2b_sino",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postppp.exe",
+            "args": ["-o","${workspaceFolder}/conf/WIN_postB2b250227_sino.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "unix_debug_postdecoder",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/postdecoder",
+            "args": ["-S","-in","/home/book/GNSS/GNSS_DataSet/20241129B2b/sinan/0222/Cor_202503020000.log","-out","./result.B2bSSR"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "unix_debug_rtdecoder",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/rtdecoder",
+            "args": ["-o","${workspaceFolder}/conf/rtdecoder250302_sino.conf","-nc"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Linux gdb 启动 - conapp",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/bin",
+            "program": "${workspaceFolder}/bin/conapp",
+            // "args": ["-o","${workspaceFolder}/util/pppost/bin/my_rtkpost_AR.conf"],
+            "stopAtEntry": true,
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description":  "将反汇编风格设置为 Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+
+    ]
+}

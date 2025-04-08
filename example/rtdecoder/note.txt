@@ -1,0 +1,1 @@
+The datasets used for testing the real-time PPP module can also be utilized in this module. Simply specify the file paths for the PPP-B2b corrections and broadcast ephemeris data, then enable replay mode to process pre-recorded data streams.

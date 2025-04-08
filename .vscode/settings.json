@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "f2c.h": "c",
+        "rtapp.h": "c",
+        "type_traits": "c",
+        "B2b.h": "c"
+    }
+}
