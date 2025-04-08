@@ -68,6 +68,7 @@ This collection supports two key application scenarios: ​**real-time playback 
 1. Dataset 1 for testing real-time module via `--playback` mode  
 2. Dataset 2 for post-processing validation with precise reference  
 
-##### ❓ Support & Feedback
+## ❓ Support & Feedback
 🚧 ​**Beta Testing Notice**: This software is currently in active development phase.
 ℹ️ ​**Detailed are description in the [User Manual](manual/RTKLIB-B2b_UserManual.pdf).**
+ℹ️ ​**Developers in China:https://gitee.com/liu-chunbobo/RTKLIB-B2b.git**
