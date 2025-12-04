@@ -1351,14 +1351,26 @@ static void update_stat(rtk_t *rtk, const obsd_t *obs, int n, int stat)
             rtk->sol.qv[5]=(float)rtk->P[5+3*rtk->nx];
         }
     }
+
+    /* use fixed solution clock for fixed ambiguity resolution */
+    if (rtk->sol.stat==SOLQ_FIX) {
+		rtk->sol.dtr[0]=rtk->xa[IC(0,opt)]; /* GPS */
+        rtk->sol.dtr[1]=rtk->xa[IC(1,opt)]-rtk->xa[IC(0,opt)]; /* GLO-GPS */
+        rtk->sol.dtr[2]=rtk->xa[IC(2,opt)]-rtk->xa[IC(0,opt)]; /* GAL-GPS */
+        rtk->sol.dtr[3]=rtk->xa[IC(3,opt)]-rtk->xa[IC(0,opt)]; /* BDS-GPS */
+#ifdef	BDS2BDS3
+		rtk->sol.dtr[NSYS] = rtk->xa[IC(NSYS, opt)] - rtk->xa[IC(0, opt)]; /* BDS3-GPS */
+#endif
+    }
+    else {
 		rtk->sol.dtr[0]=rtk->x[IC(0,opt)]; /* GPS */
         rtk->sol.dtr[1]=rtk->x[IC(1,opt)]-rtk->x[IC(0,opt)]; /* GLO-GPS */
         rtk->sol.dtr[2]=rtk->x[IC(2,opt)]-rtk->x[IC(0,opt)]; /* GAL-GPS */
         rtk->sol.dtr[3]=rtk->x[IC(3,opt)]-rtk->x[IC(0,opt)]; /* BDS-GPS */
-
 #ifdef	BDS2BDS3
-		rtk->sol.dtr[NSYS] = rtk->x[IC(NSYS, opt)] - rtk->x[IC(0, opt)]; /* BDS-GPS */
+		rtk->sol.dtr[NSYS] = rtk->x[IC(NSYS, opt)] - rtk->x[IC(0, opt)]; /* BDS3-GPS */
 #endif
+    }
 
     for (i=0;i<n&&i<MAXOBS;i++) for (j=0;j<opt->nf;j++) {
         rtk->ssat[obs[i].sat-1].snr_rover[j]=obs[i].SNR[j];
