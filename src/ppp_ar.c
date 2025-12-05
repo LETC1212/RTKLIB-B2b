@@ -16,6 +16,7 @@
 * version : $Revision:$ $Date:$
 * history : 2013/03/11 1.0  new
 *           2025/12/04 2.0  add day-to-day differencing AR for PPP-B2b
+*           2025/12/05 2.1  simplified version with day boundary detection
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -30,13 +31,9 @@
 #define MIN_ARC_TIME    30      /* minimum continuous lock time (epochs) */
 #define THRES_RATIO     3.0     /* ratio test threshold */
 #define THRES_VAR_AMB   0.25    /* variance threshold for ambiguity (cycles^2) */
-#define MIN_TIME_SPAN   72000.0 /* minimum time span for AR (20 hours in seconds) */
-#define SIDEREAL_DAY    86164.0905 /* sidereal day in seconds */
-#define MAX_AMB_SEARCH  100     /* max search iterations */
+#define MAX_TIME_DIFF   1.0     /* max time difference for day-to-day matching (sec) */
 
-/* Ambiguity arc storage - stores ambiguity history over time */
-#define MAX_AMB_HISTORY 5000    /* maximum ambiguity history entries */
-
+/* Previous day ambiguity storage */
 typedef struct {
     gtime_t time;               /* epoch time */
     int sat;                    /* satellite number */
@@ -44,11 +41,11 @@ typedef struct {
     double std[NFREQ];          /* ambiguity standard deviations (cycles) */
     int lock[NFREQ];            /* lock count */
     int valid;                  /* valid flag */
-} amb_hist_t;
+} prev_amb_t;
 
-static amb_hist_t amb_history[MAX_AMB_HISTORY];  /* ambiguity history */
-static int amb_hist_count = 0;                    /* number of history entries */
-static int amb_hist_initialized = 0;              /* initialization flag */
+static prev_amb_t prev_day_amb[MAXSAT];  /* previous day ambiguities */
+static int prev_day_initialized = 0;      /* initialization flag */
+static int current_doy = -1;              /* current day of year */
 
 /* number and index of states (from ppp.c) */
 #define NF(opt)     ((opt)->ionoopt==IONOOPT_IFLC?1:(opt)->nf)
@@ -67,164 +64,88 @@ static int amb_hist_initialized = 0;              /* initialization flag */
 #define IB(s,f,opt) (NR(opt)+MAXSAT*(f)+(s)-1)
 #define IC(s,opt)   (NP(opt)+(s))
 
-/* save ambiguity to history buffer ----------------------------------------*/
-static void save_amb_to_history(const rtk_t *rtk, const obsd_t *obs, int n)
+/* save current ambiguities for next day -----------------------------------*/
+static void save_amb_for_next_day(const rtk_t *rtk, const obsd_t *obs, int n)
 {
     const prcopt_t *opt = &rtk->opt;
     int i, j, sat, idx;
-    gtime_t oldest_time;
-    double time_span;
 
-    trace(3, "save_amb_to_history: n=%d, hist_count=%d\n", n, amb_hist_count);
+    trace(3, "save_amb_for_next_day: n=%d\n", n);
 
     /* initialize if needed */
-    if (!amb_hist_initialized) {
-        amb_hist_count = 0;
-        for (i = 0; i < MAX_AMB_HISTORY; i++) {
-            amb_history[i].valid = 0;
-        }
-        amb_hist_initialized = 1;
-    }
-
-    /* check if buffer is full - remove oldest entries if needed */
-    if (amb_hist_count >= MAX_AMB_HISTORY - MAXSAT) {
-        /* find oldest time */
-        oldest_time = amb_history[0].time;
-        for (i = 1; i < amb_hist_count; i++) {
-            if (timediff(amb_history[i].time, oldest_time) < 0) {
-                oldest_time = amb_history[i].time;
+    if (!prev_day_initialized) {
+        for (i = 0; i < MAXSAT; i++) {
+            prev_day_amb[i].valid = 0;
+            prev_day_amb[i].sat = i + 1;
+            for (j = 0; j < NFREQ; j++) {
+                prev_day_amb[i].amb[j] = 0.0;
+                prev_day_amb[i].std[j] = 0.0;
+                prev_day_amb[i].lock[j] = 0;
             }
         }
-
-        /* remove entries older than (current - 2 days) to keep buffer manageable */
-        time_span = timediff(obs[0].time, oldest_time);
-        if (time_span > 2.0 * SIDEREAL_DAY) {
-            int keep_count = 0;
-            for (i = 0; i < amb_hist_count; i++) {
-                if (timediff(obs[0].time, amb_history[i].time) < 2.0 * SIDEREAL_DAY) {
-                    if (keep_count != i) {
-                        amb_history[keep_count] = amb_history[i];
-                    }
-                    keep_count++;
-                }
-            }
-            amb_hist_count = keep_count;
-            trace(3, "Cleaned history buffer: kept %d entries\n", keep_count);
-        }
+        prev_day_initialized = 1;
     }
 
-    /* save current ambiguities to history */
+    /* save ambiguities for all satellites */
     for (i = 0; i < n && i < MAXOBS; i++) {
         sat = obs[i].sat;
         if (sat <= 0 || sat > MAXSAT) continue;
 
         idx = sat - 1;
+        prev_day_amb[idx].time = obs[i].time;
+        prev_day_amb[idx].sat = sat;
+        prev_day_amb[idx].valid = 1;
 
-        /* check if satellite has good lock and ambiguity quality */
-        if (rtk->ssat[idx].lock[0] < MIN_ARC_TIME) continue;
-
-        /* add to history */
-        if (amb_hist_count < MAX_AMB_HISTORY) {
-            amb_history[amb_hist_count].time = obs[i].time;
-            amb_history[amb_hist_count].sat = sat;
-            amb_history[amb_hist_count].valid = 1;
-
-            for (j = 0; j < NF(opt) && j < NFREQ; j++) {
-                int ib = IB(sat, j, opt);
-                if (ib >= 0 && ib < rtk->nx) {
-                    amb_history[amb_hist_count].amb[j] = rtk->x[ib];
-                    amb_history[amb_hist_count].std[j] = SQRT(rtk->P[ib + ib * rtk->nx]);
-                    amb_history[amb_hist_count].lock[j] = rtk->ssat[idx].lock[j];
-                } else {
-                    amb_history[amb_hist_count].amb[j] = 0.0;
-                    amb_history[amb_hist_count].std[j] = 999.0;
-                    amb_history[amb_hist_count].lock[j] = 0;
-                }
+        /* save ambiguity values and std for each frequency */
+        for (j = 0; j < NF(opt) && j < NFREQ; j++) {
+            int ib = IB(sat, j, opt);
+            if (ib >= 0 && ib < rtk->nx) {
+                prev_day_amb[idx].amb[j] = rtk->x[ib];
+                prev_day_amb[idx].std[j] = SQRT(rtk->P[ib + ib * rtk->nx]);
+                prev_day_amb[idx].lock[j] = rtk->ssat[idx].lock[j];
             }
-            amb_hist_count++;
         }
     }
 }
 
-/* find matching ambiguity in history using sidereal day repeat ------------*/
-static int find_matching_amb_history(int sat, gtime_t current_time,
-                                      double *amb_ref, double *std_ref, int *lock_ref)
+/* check if day has changed -------------------------------------------------*/
+static int check_day_change(gtime_t time)
 {
-    int i, best_idx = -1;
-    double time_diff, best_diff = 999999.0;
-    double target_diff;
+    double ep[6];
+    int doy;
 
-    /* target time difference: approximately one sidereal day ago */
-    target_diff = SIDEREAL_DAY;
+    time2epoch(time, ep);
+    doy = (int)time2doy(time);
 
-    /* search for matching satellite in history around sidereal day ago */
-    for (i = 0; i < amb_hist_count; i++) {
-        if (!amb_history[i].valid) continue;
-        if (amb_history[i].sat != sat) continue;
-
-        /* compute time difference */
-        time_diff = timediff(current_time, amb_history[i].time);
-
-        /* check if close to one sidereal day (with some tolerance) */
-        /* Allow ±2 hours window around sidereal day */
-        if (fabs(time_diff - target_diff) < 7200.0) {
-            /* find the closest match */
-            if (fabs(time_diff - target_diff) < best_diff) {
-                best_diff = fabs(time_diff - target_diff);
-                best_idx = i;
-            }
-        }
+    if (current_doy < 0) {
+        current_doy = doy;
+        return 0;
     }
 
-    if (best_idx >= 0) {
-        *amb_ref = amb_history[best_idx].amb[0];
-        *std_ref = amb_history[best_idx].std[0];
-        *lock_ref = amb_history[best_idx].lock[0];
-
-        trace(4, "Found history match: sat=%2d time_diff=%.1f hours best_diff=%.1f min\n",
-              sat, timediff(current_time, amb_history[best_idx].time) / 3600.0,
-              best_diff / 60.0);
+    if (doy != current_doy) {
+        trace(2, "Day changed: %d -> %d\n", current_doy, doy);
+        current_doy = doy;
         return 1;
     }
 
     return 0;
 }
 
-/* form day-to-day difference equations using history ----------------------*/
+/* form day-to-day difference equations ------------------------------------*/
 static int form_dd_equations(const rtk_t *rtk, const obsd_t *obs, int n,
                               int *sat_dd, double *dd_amb, double *dd_std)
 {
     const prcopt_t *opt = &rtk->opt;
-    int i, sat, idx, ndd = 0;
-    double amb_cur, std_cur, amb_ref, std_ref;
-    int lock_ref;
-    gtime_t oldest_hist_time;
-    double time_span;
+    int i, j, sat, idx, ndd = 0;
+    double amb_cur, std_cur, amb_prev, std_prev;
+    double time_diff;
 
-    trace(3, "form_dd_equations: n=%d hist_count=%d\n", n, amb_hist_count);
+    trace(3, "form_dd_equations: n=%d\n", n);
 
-    if (!amb_hist_initialized || amb_hist_count == 0) {
-        trace(3, "Ambiguity history not initialized or empty\n");
+    if (!prev_day_initialized) {
+        trace(3, "Previous day data not initialized\n");
         return 0;
     }
-
-    /* check if we have enough time span (at least 20 hours) */
-    oldest_hist_time = amb_history[0].time;
-    for (i = 1; i < amb_hist_count; i++) {
-        if (amb_history[i].valid &&
-            timediff(amb_history[i].time, oldest_hist_time) < 0) {
-            oldest_hist_time = amb_history[i].time;
-        }
-    }
-
-    time_span = timediff(obs[0].time, oldest_hist_time);
-    if (time_span < MIN_TIME_SPAN) {
-        trace(3, "Time span too short: %.1f hours < %.1f hours\n",
-              time_span / 3600.0, MIN_TIME_SPAN / 3600.0);
-        return 0;
-    }
-
-    trace(3, "Time span: %.1f hours, processing AR\n", time_span / 3600.0);
 
     /* form day-to-day differences for each satellite */
     for (i = 0; i < n && i < MAXOBS; i++) {
@@ -233,36 +154,36 @@ static int form_dd_equations(const rtk_t *rtk, const obsd_t *obs, int n,
 
         idx = sat - 1;
 
-        /* check current lock time */
-        if (rtk->ssat[idx].lock[0] < MIN_ARC_TIME) continue;
+        /* check if previous day data exists */
+        if (!prev_day_amb[idx].valid) continue;
 
-        /* get current ambiguity */
+        /* check lock time on both days */
+        if (rtk->ssat[idx].lock[0] < MIN_ARC_TIME) continue;
+        if (prev_day_amb[idx].lock[0] < MIN_ARC_TIME) continue;
+
+        /* get current ambiguity (use first frequency for simplicity) */
         int ib = IB(sat, 0, opt);
         if (ib < 0 || ib >= rtk->nx) continue;
 
         amb_cur = rtk->x[ib];
         std_cur = SQRT(rtk->P[ib + ib * rtk->nx]);
 
-        /* check current ambiguity variance */
+        /* check ambiguity variance */
         if (std_cur > THRES_VAR_AMB) continue;
 
-        /* find matching reference ambiguity from history */
-        if (!find_matching_amb_history(sat, obs[i].time,
-                                        &amb_ref, &std_ref, &lock_ref)) {
-            continue;  /* no matching history found */
-        }
+        /* get previous day ambiguity */
+        amb_prev = prev_day_amb[idx].amb[0];
+        std_prev = prev_day_amb[idx].std[0];
 
-        /* check reference ambiguity quality */
-        if (std_ref > THRES_VAR_AMB) continue;
-        if (lock_ref < MIN_ARC_TIME) continue;
+        if (std_prev > THRES_VAR_AMB) continue;
 
         /* form day-to-day difference */
-        dd_amb[ndd] = amb_cur - amb_ref;
-        dd_std[ndd] = SQRT(SQR(std_cur) + SQR(std_ref));
+        dd_amb[ndd] = amb_cur - amb_prev;
+        dd_std[ndd] = SQRT(SQR(std_cur) + SQR(std_prev));
         sat_dd[ndd] = sat;
 
-        trace(4, "DD sat=%2d amb_cur=%8.3f std_cur=%6.3f amb_ref=%8.3f std_ref=%6.3f dd=%8.3f\n",
-              sat, amb_cur, std_cur, amb_ref, std_ref, dd_amb[ndd]);
+        trace(4, "DD sat=%2d amb_cur=%8.3f std_cur=%6.3f amb_prev=%8.3f std_prev=%6.3f dd=%8.3f\n",
+              sat, amb_cur, std_cur, amb_prev, std_prev, dd_amb[ndd]);
 
         ndd++;
     }
@@ -318,9 +239,9 @@ static void apply_fixed_ambiguity(rtk_t *rtk, const obsd_t *obs, int n,
                                    const int *sat_dd, const int *dd_fix, int ndd)
 {
     const prcopt_t *opt = &rtk->opt;
-    int i, j, sat, idx, ib, lock_ref;
+    int i, j, sat, idx, ib;
     double *xa, *Pa;
-    double amb_ref, std_ref;
+    double delta_amb;
 
     trace(3, "apply_fixed_ambiguity: ndd=%d\n", ndd);
 
@@ -331,7 +252,7 @@ static void apply_fixed_ambiguity(rtk_t *rtk, const obsd_t *obs, int n,
     matcpy(Pa, rtk->P, rtk->nx, rtk->nx);
 
     /* apply fixed ambiguities */
-    for (i = 0; i < ndd && i < n; i++) {
+    for (i = 0; i < ndd; i++) {
         sat = sat_dd[i];
         if (sat <= 0 || sat > MAXSAT) continue;
 
@@ -340,21 +261,17 @@ static void apply_fixed_ambiguity(rtk_t *rtk, const obsd_t *obs, int n,
 
         if (ib < 0 || ib >= rtk->nx) continue;
 
-        /* find reference ambiguity from history */
-        if (!find_matching_amb_history(sat, obs[i].time,
-                                        &amb_ref, &std_ref, &lock_ref)) {
-            trace(3, "Warning: no history match for sat %d in apply_fixed\n", sat);
-            continue;
-        }
+        /* compute ambiguity correction */
+        delta_amb = dd_fix[i] - (xa[ib] - prev_day_amb[idx].amb[0]);
 
-        /* directly set ambiguity to reference + fixed integer */
-        xa[ib] = amb_ref + dd_fix[i];
+        /* update ambiguity in fixed solution */
+        xa[ib] += delta_amb;
 
         /* tighten ambiguity variance (set to very small value) */
         Pa[ib + ib * rtk->nx] = 1E-6;
 
-        trace(4, "Fixed sat=%2d: float_amb=%8.3f fixed_amb=%8.3f ref_amb=%8.3f int=%d\n",
-              sat, rtk->x[ib], xa[ib], amb_ref, dd_fix[i]);
+        trace(4, "Fixed sat=%2d: float_amb=%8.3f fixed_amb=%8.3f delta=%8.3f\n",
+              sat, rtk->x[ib], xa[ib], delta_amb);
     }
 
     /* mark satellites as fixed */
@@ -462,8 +379,15 @@ extern int pppamb(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav,
         return 0;
     }
 
-    /* continuously save ambiguities to history buffer */
-    save_amb_to_history(rtk, obs, n);
+    /* check if day has changed - save previous day data */
+    if (check_day_change(obs[0].time)) {
+        /* day changed - previous float solution becomes reference */
+        save_amb_for_next_day(rtk, obs, n);
+        return 0;  /* cannot fix on first day */
+    }
+
+    /* save current ambiguities continuously */
+    save_amb_for_next_day(rtk, obs, n);
 
     /* form day-to-day difference equations */
     ndd = form_dd_equations(rtk, obs, n, sat_dd, dd_amb, dd_std);
