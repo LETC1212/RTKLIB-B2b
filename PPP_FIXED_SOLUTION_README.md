@@ -18,10 +18,18 @@ The traditional PPP ambiguity resolution is challenging for PPP-B2b due to:
 - Uncalibrated phase biases
 
 The day-to-day differencing technique addresses these challenges by:
-- Using observations from two consecutive days
-- Forming differences between ambiguities estimated on different days
-- Leveraging the fact that satellite geometry repeats approximately every sidereal day
+- **Using sidereal day repetition** (approximately 23h 56m 4s)
+- **Continuous ambiguity history storage** (up to 2 days)
+- **Flexible time matching** (±2 hour window around sidereal day)
+- **No requirement for exact time alignment** between observation epochs
 - Canceling common systematic errors through differencing
+
+**Important**: This implementation does NOT require:
+- Observations at identical UTC times on consecutive days
+- Perfectly aligned observation epochs
+- Special processing for day boundaries
+
+The algorithm automatically finds matching satellite geometry using sidereal day repetition.
 
 ### 2. Implementation Details
 
@@ -29,15 +37,23 @@ The day-to-day differencing technique addresses these challenges by:
 
 The implementation consists of several key components:
 
-1. **Previous Day Ambiguity Storage**
-   - Stores ambiguity estimates from the previous day
-   - Includes ambiguity values, standard deviations, and lock counts
-   - Automatically resets when day changes
+1. **Continuous Ambiguity History Buffer** (NEW - improved robustness)
+   - Stores up to 5000 ambiguity estimates over time
+   - Automatically manages buffer (removes old entries > 2 days)
+   - Continuously saves ambiguities from all good satellites
+   - No dependency on day boundaries
 
-2. **Day-to-Day Difference Formation**
-   - Matches satellites between consecutive days
-   - Computes ambiguity differences: `dd_amb = amb_current - amb_previous`
+2. **Sidereal Day Matching**
+   - Searches for matching satellite geometry approximately one sidereal day ago
+   - Uses ±2 hour time window around sidereal day (86164.09 seconds)
+   - Selects closest match within the window
+   - Handles missing or incomplete data gracefully
+
+3. **Day-to-Day Difference Formation**
+   - Finds reference ambiguity using sidereal day matching
+   - Computes ambiguity differences: `dd_amb = amb_current - amb_reference`
    - Validates data quality using:
+     - Minimum time span (20 hours)
      - Minimum lock time (30 epochs by default)
      - Maximum ambiguity variance threshold (0.25 cycles²)
      - Minimum satellite count (4 satellites)
@@ -98,19 +114,27 @@ prcopt.thresar[0] = 3.0  # AR ratio test threshold
 
 ## Usage
 
-### Processing Two-Day Data
+### Processing Multi-Day Data
 
-For optimal performance, process observations spanning at least two consecutive days:
+For optimal performance, process observations spanning at least 20-24 hours:
 
 ```bash
 ./postppp -c config.conf
 ```
 
+**Data Requirements:**
+1. **Minimum time span**: 20 hours (for sidereal day matching)
+2. **Recommended**: 24+ hours for better AR success rate
+3. **Observation file format**:
+   - Single file containing 20+ hours of data (recommended), OR
+   - Multiple daily files processed sequentially (postppp handles automatically)
+
 **Important Notes:**
-1. On the first day, only float solutions will be produced
-2. Starting from the second day, fixed solutions become available
-3. Ensure continuous tracking of satellites across day boundaries
-4. Higher elevation satellites typically provide better AR performance
+1. Fixed solutions become available after ~20 hours of processing
+2. **NO need for identical observation times** between days
+3. **NO need for perfect epoch alignment** - the algorithm handles gaps and irregularities
+4. Continuous satellite tracking improves success rate
+5. Higher elevation satellites provide better AR performance
 
 ### Output Solution Status
 
@@ -129,11 +153,20 @@ Fixed solutions also include:
 The following parameters can be tuned in `src/ppp_ar.c`:
 
 ```c
-#define MIN_ARC_SAT     4       /* minimum satellites for AR */
-#define MIN_ARC_TIME    30      /* minimum continuous lock time (epochs) */
-#define THRES_RATIO     3.0     /* ratio test threshold */
-#define THRES_VAR_AMB   0.25    /* variance threshold for ambiguity (cycles²) */
+#define MIN_ARC_SAT     4           /* minimum satellites for AR */
+#define MIN_ARC_TIME    30          /* minimum continuous lock time (epochs) */
+#define THRES_RATIO     3.0         /* ratio test threshold */
+#define THRES_VAR_AMB   0.25        /* variance threshold for ambiguity (cycles²) */
+#define MIN_TIME_SPAN   72000.0     /* minimum time span for AR (20 hours) */
+#define SIDEREAL_DAY    86164.0905  /* sidereal day in seconds */
+#define MAX_AMB_HISTORY 5000        /* maximum ambiguity history entries */
 ```
+
+**Parameter Tuning Guidelines:**
+- `MIN_TIME_SPAN`: Reduce to 64800 (18 hours) for faster AR, increase to 86400 (24 hours) for higher reliability
+- `THRES_RATIO`: Increase to 4.0-5.0 for stricter validation
+- `THRES_VAR_AMB`: Reduce to 0.15 for stricter ambiguity quality
+- Sidereal day matching window: Currently ±2 hours (hardcoded in `find_matching_amb_history`)
 
 ## Output Clock Products
 
