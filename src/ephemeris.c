@@ -478,8 +478,8 @@ extern void seph2pos(gtime_t time, const seph_t *seph, double *rs, double *dts,
 /* select ephemeris --------------------------------------------------------*/
 static eph_t *seleph(gtime_t time, int sat, int iode, const nav_t *nav)
 {
-	double t, tmax, tmin;
-	int i, j = -1, sys, sel = 0;
+	double t, tmax, tmin, tmin_all;
+	int i, j = -1, j_all = -1, sys, sel = 0;
     int n;
     int brdc_iod;  // Holds ephemeris IOD value for SSR matching
 
@@ -495,17 +495,18 @@ static eph_t *seleph(gtime_t time, int sat, int iode, const nav_t *nav)
 	default: tmax = MAXDTOE + 1.0; break;
 	}
 	tmin = tmax + 1.0;
+	tmin_all = 1E9;  // Initialize with a very large value for fallback search
 
     if (PPP_Glo.RT_flag == 0) n = nav->n;
     if (PPP_Glo.RT_flag == 1) n = 2*nav->n;
-    
+
 
 	for (i = 0; i<n; i++) {
         // B2b-SSR scenario: IODC from ephemeris for B2bSSR IODN comparison
-        if (PPP_Glo.BDS_CNV1_flag == 1) brdc_iod = nav->eph[i].iodc;  
-        // IGS-SSR scenario: IODE from ephemeris for IGS-SSR IODE comparison  
+        if (PPP_Glo.BDS_CNV1_flag == 1) brdc_iod = nav->eph[i].iodc;
+        // IGS-SSR scenario: IODE from ephemeris for IGS-SSR IODE comparison
         if (PPP_Glo.BDS_CNV1_flag == 0) brdc_iod = nav->eph[i].iode;
-        
+
 		if (nav->eph[i].sat != sat) continue;
 		if (iode >= 0 && brdc_iod != iode) continue;
 		if (sys == SYS_GAL) {
@@ -513,7 +514,7 @@ static eph_t *seleph(gtime_t time, int sat, int iode, const nav_t *nav)
 			/**
              * Liu@APM:In demo5 version, Galileo ephemeris is arbitrarily selected (the newer one between FNAV and INAV is used).
              * However, according to the description in "igs_ssr_v1.pdf":
-             * "Clock corrections in RTCM-SSR are related to a broadcast reference clock. 
+             * "Clock corrections in RTCM-SSR are related to a broadcast reference clock.
              * The I/NAV clock has been chosen as the reference clock for RTCM Galileo SSR correction."
              * Therefore, the program should choose the I/NAV ephemeris.
              * So sel will be return 0,nav->eph[i].code&(1<<9) is INAV.
@@ -524,10 +525,28 @@ static eph_t *seleph(gtime_t time, int sat, int iode, const nav_t *nav)
 			// if (sel == 2 && !(nav->eph[i].code&(1 << 8))) continue; /* F/NAV */
 			if (timediff(nav->eph[i].toe, time) >= 0.0) continue; /* AOD<=0 */
 		}
-		if ((t = fabs(timediff(nav->eph[i].toe, time)))>tmax) continue;
+
+		t = fabs(timediff(nav->eph[i].toe, time));
+
+		// Track closest ephemeris regardless of time threshold (fallback)
+		if (t < tmin_all) {
+			j_all = i;
+			tmin_all = t;
+		}
+
+		// Primary selection: within time threshold
+		if (t > tmax) continue;
 		if (iode >= 0) return nav->eph + i;
 		if (t <= tmin) { j = i; tmin = t; } /* toe closest to time */
 	}
+
+	// If no ephemeris found within threshold, use the closest one as fallback
+	if (j < 0 && j_all >= 0 && iode < 0) {
+		trace(3, "using fallback ephemeris (dt=%.0fs > tmax=%.0fs): %s sat=%2d\n",
+			tmin_all, tmax, time_str(time, 0), sat);
+		return nav->eph + j_all;
+	}
+
 	if (iode >= 0 || j<0) {
 		trace(2, "no broadcast ephemeris: %s sat=%2d iode=%3d\n", time_str(time, 0),
 			sat, iode);
@@ -539,18 +558,36 @@ static eph_t *seleph(gtime_t time, int sat, int iode, const nav_t *nav)
 /* select glonass ephemeris --------------------------------------------------*/
 static geph_t *selgeph(gtime_t time, int sat, int iode, const nav_t *nav)
 {
-    double t,tmax=MAXDTOE_GLO,tmin=tmax+1.0;
-    int i,j=-1;
+    double t,tmax=MAXDTOE_GLO,tmin=tmax+1.0,tmin_all=1E9;
+    int i,j=-1,j_all=-1;
 
     trace(4,"selgeph : time=%s sat=%2d iode=%2d\n",time_str(time,3),sat,iode);
 
     for (i=0;i<nav->ng;i++) {
         if (nav->geph[i].sat!=sat) continue;
         if (iode>=0&&nav->geph[i].iode!=iode) continue;
-        if ((t=fabs(timediff(nav->geph[i].toe,time)))>tmax) continue;
+
+        t=fabs(timediff(nav->geph[i].toe,time));
+
+        // Track closest ephemeris regardless of time threshold (fallback)
+        if (t<tmin_all) {
+            j_all=i;
+            tmin_all=t;
+        }
+
+        // Primary selection: within time threshold
+        if (t>tmax) continue;
         if (iode>=0) return nav->geph+i;
         if (t<=tmin) {j=i; tmin=t;} /* toe closest to time */
     }
+
+    // If no ephemeris found within threshold, use the closest one as fallback
+    if (j<0 && j_all>=0 && iode<0) {
+        trace(3,"using fallback glonass ephemeris (dt=%.0fs > tmax=%.0fs): %s sat=%2d\n",
+              tmin_all,tmax,time_str(time,0),sat);
+        return nav->geph+j_all;
+    }
+
     if (iode>=0||j<0) {
         trace(3,"no glonass ephemeris  : %s sat=%2d iode=%2d\n",time_str(time,0),
               sat,iode);
@@ -562,16 +599,34 @@ static geph_t *selgeph(gtime_t time, int sat, int iode, const nav_t *nav)
 /* select sbas ephemeris -----------------------------------------------------*/
 static seph_t *selseph(gtime_t time, int sat, const nav_t *nav)
 {
-    double t,tmax=MAXDTOE_SBS,tmin=tmax+1.0;
-    int i,j=-1;
+    double t,tmax=MAXDTOE_SBS,tmin=tmax+1.0,tmin_all=1E9;
+    int i,j=-1,j_all=-1;
 
     trace(4,"selseph : time=%s sat=%2d\n",time_str(time,3),sat);
 
     for (i=0;i<nav->ns;i++) {
         if (nav->seph[i].sat!=sat) continue;
-        if ((t=fabs(timediff(nav->seph[i].t0,time)))>tmax) continue;
+
+        t=fabs(timediff(nav->seph[i].t0,time));
+
+        // Track closest ephemeris regardless of time threshold (fallback)
+        if (t<tmin_all) {
+            j_all=i;
+            tmin_all=t;
+        }
+
+        // Primary selection: within time threshold
+        if (t>tmax) continue;
         if (t<=tmin) {j=i; tmin=t;} /* toe closest to time */
     }
+
+    // If no ephemeris found within threshold, use the closest one as fallback
+    if (j<0 && j_all>=0) {
+        trace(3,"using fallback sbas ephemeris (dt=%.0fs > tmax=%.0fs): %s sat=%2d\n",
+              tmin_all,tmax,time_str(time,0),sat);
+        return nav->seph+j_all;
+    }
+
     if (j<0) {
         trace(3,"no sbas ephemeris     : %s sat=%2d\n",time_str(time,0),sat);
         return NULL;
