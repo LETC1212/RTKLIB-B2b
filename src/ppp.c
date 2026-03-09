@@ -62,6 +62,11 @@
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
+/* Pass-by-Pass paper-style session re-resolve hooks */
+extern int pbp_resolve_flag;
+extern int pbp_has_fixed_constraints(void);
+extern int pbp_apply_session_pseudoobs(rtk_t *rtk); /* legacy no-op */
+extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var);
 #define SQR(x)      ((x)*(x))
 #define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
 #define MAX(x,y)    ((x)>(y)?(x):(y))
@@ -176,12 +181,67 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 
     /* receiver clocks */
     i = IC(0, &rtk->opt);
+#ifdef ENAIRN
+#ifdef BDS2BDS3
+    /* output all 6 systems: GPS, GLO, GAL, BDS2, IRN, BDS3 */
+    p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                sol_time_str, rtk->sol.stat, 1,
+                x[i] * 1E9 / CLIGHT,              // GPS 绝对钟差
+                x[i + 1] * 1E9 / CLIGHT, // GLO 绝对钟差
+                x[i + 2] * 1E9 / CLIGHT, // GAL 绝对钟差 
+                x[i + 3] * 1E9 / CLIGHT, // BDS2 绝对钟差 
+                x[i + 4] * 1E9 / CLIGHT, // IRN 绝对钟差 
+                x[i + 5] * 1E9 / CLIGHT, // BDS3 绝对钟差 
+                STD(rtk, i) * 1E9 / CLIGHT,
+                STD(rtk, i + 1) * 1E9 / CLIGHT, 
+                STD(rtk, i + 2) * 1E9 / CLIGHT, 
+                STD(rtk, i + 3) * 1E9 / CLIGHT,
+                STD(rtk, i + 4) * 1E9 / CLIGHT, 
+                STD(rtk, i + 5) * 1E9 / CLIGHT);
+#else
+    /* output 5 systems: GPS, GLO, GAL, BDS2, IRN (no BDS3) */
+    p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                sol_time_str, rtk->sol.stat, 1,
+                x[i] * 1E9 / CLIGHT,
+                x[i + 1] * 1E9 / CLIGHT,
+                x[i + 2] * 1E9 / CLIGHT,
+                x[i + 3] * 1E9 / CLIGHT,
+                x[i + 4] * 1E9 / CLIGHT,
+                STD(rtk, i) * 1E9 / CLIGHT,
+                STD(rtk, i + 1) * 1E9 / CLIGHT,
+                STD(rtk, i + 2) * 1E9 / CLIGHT,
+                STD(rtk, i + 3) * 1E9 / CLIGHT,
+                STD(rtk, i + 4) * 1E9 / CLIGHT);
+#endif
+#else
+#ifdef BDS2BDS3
+    /* output 5 systems: GPS, GLO, GAL, BDS2, BDS3 (no IRN) */
+    p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                sol_time_str, rtk->sol.stat, 1,
+                x[i] * 1E9 / CLIGHT,
+                x[i + 1] * 1E9 / CLIGHT,
+                x[i + 2] * 1E9 / CLIGHT,
+                x[i + 3] * 1E9 / CLIGHT,
+                x[i + 5] * 1E9 / CLIGHT,  // BDS3 is at i+5 even without IRN
+                STD(rtk, i) * 1E9 / CLIGHT,
+                STD(rtk, i + 1) * 1E9 / CLIGHT,
+                STD(rtk, i + 2) * 1E9 / CLIGHT,
+                STD(rtk, i + 3) * 1E9 / CLIGHT,
+                STD(rtk, i + 5) * 1E9 / CLIGHT);
+#else
+    /* output 4 systems: GPS, GLO, GAL, BDS2 (no IRN, no BDS3) */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                 sol_time_str, rtk->sol.stat, 1, x[i] * 1E9 / CLIGHT,
-                 x[i + 1] * 1E9 / CLIGHT, x[i + 2] * 1E9 / CLIGHT,
-                 x[i + 3] * 1E9 / CLIGHT, STD(rtk, i) * 1E9 / CLIGHT,
-                 STD(rtk, i + 1) * 1E9 / CLIGHT, STD(rtk, i + 2) * 1E9 / CLIGHT,
-                 STD(rtk, i + 3) * 1E9 / CLIGHT);
+                sol_time_str, rtk->sol.stat, 1,
+                x[i] * 1E9 / CLIGHT,
+                x[i + 1] * 1E9 / CLIGHT,
+                x[i + 2] * 1E9 / CLIGHT,
+                x[i + 3] * 1E9 / CLIGHT,
+                STD(rtk, i) * 1E9 / CLIGHT,
+                STD(rtk, i + 1) * 1E9 / CLIGHT,
+                STD(rtk, i + 2) * 1E9 / CLIGHT,
+                STD(rtk, i + 3) * 1E9 / CLIGHT);
+#endif
+#endif
 
     /* tropospheric parameters */
     if (rtk->opt.tropopt == TROPOPT_EST || rtk->opt.tropopt == TROPOPT_ESTG) {
@@ -895,6 +955,8 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
             }
         }
         for (i=k=0;i<n&&i<MAXOBS;i++) {
+            double bfix=0.0,vfix=0.0;
+            int has_fix_arc = 0;
             sat=obs[i].sat;
             j=IB(sat,f,&rtk->opt);
 			corr_meas(obs+i,nav,rtk->ssat[sat-1].azel,&rtk->opt,dantr,0,0,0,dants,
@@ -917,6 +979,8 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                     ion=(obs[i].P[0]-obs[i].P[f])/(1.0-SQR(freq1/freq2));
                 bias[i]=L[f]-P[f]+2.0*ion*SQR(freq1/freq2);
             }
+            has_fix_arc = (f==0) && pbp_get_fixed_arc_bias(obs[i].time, sat, &bfix, &vfix);
+            if (has_fix_arc) continue; /* do not let phase-code jump offset drag fixed arcs */
             if (rtk->x[j]==0.0||slip[i]||bias[i]==0.0) continue;
 
             offset+=bias[i]-rtk->x[j];
@@ -932,10 +996,32 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                   time_str(rtk->sol.time,0),k,offset/k/CLIGHT);
         }
         for (i=0;i<n&&i<MAXOBS;i++) {
+            double bfix=0.0,vfix=0.0;
+            int has_fix_arc = 0;
             sat=obs[i].sat;
             j=IB(sat,f,&rtk->opt);
 
             rtk->P[j+j*rtk->nx]+=SQR(rtk->opt.prn[0])*fabs(rtk->tt);
+
+            has_fix_arc = (f==0) && pbp_get_fixed_arc_bias(obs[i].time, sat, &bfix, &vfix);
+            if (has_fix_arc) {
+                /*
+                 * Paper-style pass-2 re-resolve:
+                 * use the solved arc IF ambiguity as an arc-level prior only.
+                 * Do not re-force the ambiguity every epoch, otherwise the EKF
+                 * can be over-constrained before clocks/trop converge and the
+                 * session may remain at Q=0 with no .stat output.
+                 */
+                if (vfix <= 0.0) vfix = SQR(0.05);
+                if (vfix < SQR(0.01)) vfix = SQR(0.01);
+                if (vfix > VAR_BIAS) vfix = VAR_BIAS;
+                if (rtk->x[j]==0.0 || slip[i]) {
+                    initx(rtk,bfix,vfix,IB(sat,f,&rtk->opt));
+                    for (k=0;k<MAXSAT;k++) rtk->ambc[sat-1].flags[k]=0;
+                    trace(3,"udbias_ppp: sat=%2d fixed_arc_bias_init=%.3f var=%.6g\n",sat,bfix,vfix);
+                }
+                continue;
+            }
 
             if (bias[i]==0.0||(rtk->x[j]!=0.0&&!slip[i])) continue;
 
@@ -1209,6 +1295,7 @@ static int ppp_res(int post, const obsd_t *obs, int n, const double *rs,
 				k = NSYS;
 #endif
 			cdtr=x[IC(k,opt)];
+            
 			if (H) {
 				H[IC(k,opt)+nx*nv]=1.0;
 
@@ -1354,10 +1441,14 @@ static void update_stat(rtk_t *rtk, const obsd_t *obs, int n, int stat)
 		rtk->sol.dtr[0]=rtk->x[IC(0,opt)]; /* GPS */
         rtk->sol.dtr[1]=rtk->x[IC(1,opt)]-rtk->x[IC(0,opt)]; /* GLO-GPS */
         rtk->sol.dtr[2]=rtk->x[IC(2,opt)]-rtk->x[IC(0,opt)]; /* GAL-GPS */
-        rtk->sol.dtr[3]=rtk->x[IC(3,opt)]-rtk->x[IC(0,opt)]; /* BDS-GPS */
+        rtk->sol.dtr[3]=rtk->x[IC(3,opt)]-rtk->x[IC(0,opt)]; /* BDS2-GPS */
+        
+#ifdef	ENAIRN        
+        rtk->sol.dtr[4]=rtk->x[IC(4,opt)]-rtk->x[IC(0,opt)]; /* IRN-GPS */
+#endif
 
 #ifdef	BDS2BDS3
-		rtk->sol.dtr[NSYS] = rtk->x[IC(NSYS, opt)] - rtk->x[IC(0, opt)]; /* BDS-GPS */
+		rtk->sol.dtr[NSYS] = rtk->x[IC(NSYS, opt)] - rtk->x[IC(0, opt)]; /* BDS3-GPS */
 #endif
 
     for (i=0;i<n&&i<MAXOBS;i++) for (j=0;j<opt->nf;j++) {
@@ -1456,7 +1547,16 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 		if (ppp_res(i+1,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel)) {
 			matcpy(rtk->x,xp,rtk->nx,1);
 			matcpy(rtk->P,Pp,rtk->nx,rtk->nx);
-			stat=SOLQ_PPP;
+			/*
+			 * IMPORTANT:
+			 * In Pass-2 paper-style re-resolve we must NOT set stat=SOLQ_FIX here.
+			 * Doing so skips the whole "if (stat==SOLQ_PPP)" branch below, which
+			 * contains ppp_res(9), update_stat(), and the normal solution-output path.
+			 * That was the direct reason for Pass-2 epochs ending up as Q=0 with no
+			 * .stat output.  Keep the EKF result as SOLQ_PPP here, then mark it FIX
+			 * only after xa/Pa are prepared and update_stat() is called.
+			 */
+			stat = SOLQ_PPP;
 			break;
 		}
 	}
@@ -1472,10 +1572,23 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 			matcpy(rtk->xa,xp,rtk->nx,1);
 			matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
 
-			/*ambiguity resolution in ppp*/
-			if (opt->modear!=ARMODE_OFF)
+			/* ambiguity resolution in ppp */
+			if (pbp_resolve_flag && pbp_has_fixed_constraints()) {
+				/*
+				 * Paper-style pass-2:
+				 * the fixed DD constraints have already been absorbed into the solved
+				 * arc-level IF ambiguities used in udstate/udbias. There is no extra
+				 * epoch-wise AR step here. We still need xa/Pa and update_stat() to run
+				 * through the standard output path, so copy the converged EKF state to
+				 * xa/Pa and then label the solution as FIX for output purposes.
+				 */
+				matcpy(rtk->xa,xp,rtk->nx,1);
+				matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
+				stat = SOLQ_FIX;
+				rtk->sol.ratio = 0.;
+			}
+			else if (opt->modear!=ARMODE_OFF)
 			{
-				// if (isapplypppar && pppamb(rtk,obs,n,nav,azel,exc)) {
                 if (isapplypppar) {
                     if(pppamb(rtk,obs,n,nav,azel,exc)){
                         stat=SOLQ_FIX;
@@ -1512,4 +1625,28 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
     }
     free(rs); free(dts); free(var); free(azel);
     free(xp); free(Pp); free(v); free(H); free(R);
+}
+
+
+/* -----------------------------------------------------------------------
+ * pbp_varerr : wrapper exposing static varerr() to pass-by-pass AR module
+ *
+ * varerr() is static in ppp.c and therefore not directly callable from
+ * ppp_ar_passbypass.c. This thin wrapper makes it linkable externally
+ * without touching the varerr() implementation.
+ *
+ * Arguments are identical to varerr():
+ *   sat       : satellite number
+ *   sys       : satellite system (SYS_GPS / SYS_CMP / ...)
+ *   el        : elevation angle (rad)  [rtk->ssat[sat-1].azel[1]]
+ *   snr_rover : rover SNR (dBHz)       [SNR_UNIT * rtk->ssat[sat-1].snr_rover[frq]]
+ *   f         : obs type (0=L1 phase, 1=P1 code, 2=L2 phase, 3=P2 code)
+ *   opt       : processing options
+ *   obs       : observation data
+ * Return: observation error variance (m^2)
+ * ----------------------------------------------------------------------- */
+extern double pbp_varerr(int sat, int sys, double el, double snr_rover,
+                          int f, const prcopt_t *opt, const obsd_t *obs)
+{
+    return varerr(sat, sys, el, snr_rover, f, opt, obs);
 }
