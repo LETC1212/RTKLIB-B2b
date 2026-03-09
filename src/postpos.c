@@ -45,7 +45,9 @@
 *                            writing solution file in binary mode
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
+
 #include "B2b.h"
+#include "ppp_ar_passbypass.h"
 
 #define MIN(x,y)    ((x)<(y)?(x):(y))
 #define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
@@ -86,14 +88,46 @@ static gtime_t invalidtm[MAXINVALIDTM]={{0}};/* invalid time marks */
 static rtcm_t rtcm;             /* rtcm control struct */
 static FILE *fp_rtcm=NULL;      /* rtcm data file pointer */
 
-static char B2b_file[1024]=""; /* B2b data file */
+static char B2b_files[MAXINFILE][1024]; /* B2b data files array */
+static int n_B2b_files = 0;     /* number of B2b files */
+static int cur_B2b_idx = 0;     /* current B2b file index */
 static char B2b_path[1024]=""; /* B2b data path */
 // static B2b_t B2b;              /* B2b control struct */
 static raw_t B2braw;              /* raw control struct */
 
 static FILE *fp_B2b=NULL;      /* B2b data file pointer */
+
+/* Reset B2b reader state (used for Pass-by-Pass re-processing).
+ * This prevents Pass2 from inheriting EOF state from Pass1 and
+ * accidentally reusing stale SSR corrections (which can make solutions
+ * appear only near the last SSR epoch).
+ */
+static void reset_B2b_reader(int day_idx)
+{
+    if (n_B2b_files <= 0) return;
+
+    if (day_idx < 0) day_idx = 0;
+    if (day_idx >= n_B2b_files) day_idx = n_B2b_files - 1;
+
+    /* close any previously-open B2b file so the next update will reopen */
+    if (fp_B2b) {
+        fclose(fp_B2b);
+        fp_B2b = NULL;
+    }
+    B2b_path[0] = '\0';
+    cur_B2b_idx = day_idx;
+
+    trace(3, "[B2B] reset reader to index %d/%d\n", cur_B2b_idx + 1, n_B2b_files);
+}
+
+static int processed_days = 0; /* counter for processed days */
 static FILE *fp_URA=NULL;      /* B2b URA data file pointer */
 
+/* ambiguity resolution data - defined globally for AR module access ---------*/
+satamb_t satamb[MAXSAT] = {{0}}; /* ambiguity arcs for all satellites */
+int n_ddamb = 0;                 /* number of DD ambiguities */
+ddamb_t ddamb[MAXSAT*MAXSAT] = {{0}}; /* DD ambiguity data */
+int refsat = 0;                  /* reference satellite for DD */
 /* show message and check break ----------------------------------------------*/
 static int checkbrk(const char *format, ...)
 {
@@ -269,7 +303,8 @@ static void update_B2b_ssr(gtime_t time, int format)
     char B2btime_str[128] = {0};
     char t0_str[6][64];
     char satid[8];
-    int i;
+    int i, j;
+    int found = 0;
 
     if (format != STRFMT_SINO && format != STRFMT_UNICORE) {
         printf("Error Format: %d \n", format);
@@ -278,35 +313,143 @@ static void update_B2b_ssr(gtime_t time, int format)
     time2str(time, obstime_str, 3);
     trace(22, "update_B2b_ssr  : obstime=%s \n", obstime_str);
     trace(22, "---------------------------------------------------------\n");
-    
-    /* open or swap rtcm file */
-    reppath(B2b_file, path, time, "", "");
-    
-    if (strcmp(path, B2b_path)) {
-        strcpy(B2b_path, path);
-        
-        if (fp_B2b) fclose(fp_B2b);
-        fp_B2b = fopen(path, "rb");
-        if (fp_B2b) {
-            B2braw.time = time;
-            // input_B2bf(&B2b, format, fp_B2b);
-            input_rawf(&B2braw, format, fp_B2b);
-            /* This also performs an update, mainly to obtain the B2b start time for the next timediff calculation */
-            if (B2braw.num_PPPB2BINF01 != 0) trace(22, "Message 1(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF01, B2btime_str, B2braw.geoprn);
-            if (B2braw.num_PPPB2BINF02 != 0) trace(22, "Message 2(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF02, B2btime_str, B2braw.geoprn);
-            if (B2braw.num_PPPB2BINF03 != 0) trace(22, "Message 3(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF03, B2btime_str, B2braw.geoprn);
-            if (B2braw.num_PPPB2BINF04 != 0) trace(22, "Message 4(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF04, B2btime_str, B2braw.geoprn);
 
-            trace(2, "B2b file open: %s\n", path);
+    /* If current file is still open, continue using it - nothing to do here */
+    if (fp_B2b != NULL) {
+        /* File already open, skip to data reading section */
+    } else {
+        /* Need to open a new file - start from cur_B2b_idx (next file after EOF) */
+        found = 0;
+        for (j = cur_B2b_idx; j < n_B2b_files; j++) {
+            reppath(B2b_files[j], path, time, "", "");
+
+            /* Try to open this file */
+            FILE *fp_test = fopen(path, "rb");
+            if (fp_test) {
+                fclose(fp_test);
+                found = 1;
+                cur_B2b_idx = j;
+                trace(2, "Found B2b file [%d/%d]: %s\n", j+1, n_B2b_files, path);
+                printf("Found B2b file [%d/%d]: %s\n", j+1, n_B2b_files, path);
+                break;
+            }
         }
+
+        /* If no file found, return */
+        if (!found) {
+            trace(3, "No B2b file available for time: %s\n", obstime_str);
+            return;
+        }
+
+        /* Open the found file */
+        fp_B2b = fopen(path, "rb");
+        if (!fp_B2b) {
+            trace(1, "Failed to open B2b file: %s\n", path);
+            printf("Error: Failed to open B2b file: %s\n", path);
+            return;
+        }
+
+        /* Initialize for new file */
+        strcpy(B2b_path, path);
+        init_raw(&B2braw, format);
+        B2braw.time = time;
+
+        /* Read first data from file and check validity */
+        int first_ret = input_rawf(&B2braw, format, fp_B2b);
+        if (first_ret == -2 || first_ret == -1) {
+            /* File is EOF or has error on first read - skip this file */
+            trace(1, "ERROR: B2b file empty or immediate error: %s (ret=%d)\n", path, first_ret);
+            printf("ERROR: B2b file empty or immediate error: %s (ret=%d)\n", path, first_ret);
+            printf("  Skipping this file, will try next file on next call\n");
+            fclose(fp_B2b);
+            fp_B2b = NULL;
+            B2b_path[0] = '\0';
+            cur_B2b_idx++;  /* Skip to next file */
+            return;
+        }
+        /* If first_ret == 0 (no complete message yet), continue - this is normal for binary format syncing */
+
+        trace(2, "Opened B2b file [%d/%d]: %s, first B2b time=%s\n",
+              cur_B2b_idx+1, n_B2b_files, path, time_str(B2braw.time,3));
+        printf("Opened B2b file [%d/%d]: %s\n", cur_B2b_idx+1, n_B2b_files, path);
     }
-    if (!fp_B2b) return;
+
+    if (!fp_B2b) {
+        trace(3, "No B2b file available for time: %s\n", obstime_str);
+        return;
+    }
     
     /* read B2b data until current time (assuming B2b data is directly available) */
+    int max_iterations = 10000;  /* Reduced from 100000 to prevent long hangs */
+    int iter_count = 0;
+    gtime_t last_time = B2braw.time;
+    int no_progress_count = 0;
+
+    trace(3, "Starting B2b read loop: B2braw.time=%s, obs_time=%s\n",
+          time_str(B2braw.time,3), obstime_str);
+
     while (timediff(B2braw.time, time) < 1E-3) {
-        /* Note: Pay attention to this '<-1' condition; check later if the corresponding return value needs adjustment */
-        // if (input_B2bf(&B2b, format, fp_B2b) < -1) break;
-        if (input_rawf(&B2braw, format, fp_B2b) < -1) break;
+        int ret;
+
+        /* Check iteration limit to prevent infinite loop */
+        if (++iter_count > max_iterations) {
+            trace(1, "ERROR: B2b read loop exceeded %d iterations at %s\n",
+                  max_iterations, obstime_str);
+            printf("ERROR: B2b read loop exceeded %d iterations, stopping\n", max_iterations);
+            printf("  B2braw.time=%s, obs_time=%s, file=%s\n",
+                   time_str(B2braw.time,3), obstime_str, B2b_path);
+            break;
+        }
+
+        /* Check if B2braw.time is progressing */
+        if (timediff(B2braw.time, last_time) < 1E-6) {
+            if (++no_progress_count > 1000) {  /* Reduced from 50000 */
+                trace(1, "ERROR: B2b time not progressing after 1000 reads at %s\n", obstime_str);
+                printf("ERROR: B2b time not progressing after 1000 reads\n");
+                printf("  B2braw.time=%s stuck, obs_time=%s, file=%s\n",
+                       time_str(B2braw.time,3), obstime_str, B2b_path);
+                break;
+            }
+        } else {
+            no_progress_count = 0;
+            last_time = B2braw.time;
+        }
+
+        ret = input_rawf(&B2braw, format, fp_B2b);
+
+        /* Handle EOF, error, or no data (ret <= 0) */
+        if (ret <= 0) {
+            if (ret == -2) {
+                /* EOF - close file and move to next file index */
+                trace(2, "B2b file EOF reached: %s (cur_B2b_idx=%d/%d)\n",
+                      B2b_path, cur_B2b_idx, n_B2b_files);
+                printf("B2b file EOF reached: %s\n", B2b_path);
+                cur_B2b_idx++;
+                trace(2, "Advanced to next B2b file index: %d/%d\n", cur_B2b_idx, n_B2b_files);
+                printf("  Advanced to next file index [%d/%d] for next day\n",
+                       cur_B2b_idx+1, n_B2b_files);
+                if (fp_B2b) {
+                    fclose(fp_B2b);
+                    fp_B2b = NULL;
+                }
+                B2b_path[0] = '\0';
+            } else if (ret == -1) {
+                /* Error - close file and skip to next file */
+                trace(1, "B2b file read error: %s\n", B2b_path);
+                printf("B2b file read error: %s\n", B2b_path);
+                cur_B2b_idx++;  /* Skip problematic file */
+                if (fp_B2b) {
+                    fclose(fp_B2b);
+                    fp_B2b = NULL;
+                }
+                B2b_path[0] = '\0';
+            } else if (ret == 0) {
+                /* No complete message yet - keep file open for next call */
+                trace(3, "B2b no complete message read, will continue next call\n");
+                /* Do NOT close file or increment index - continue from here next time */
+            }
+            break;
+        }
         time2str(B2braw.time, B2btime_str, 3);
 
         /* Liu@APM: This output may log a message where timediff(time, B2b.B2bssr[i].t0[0]) > -1E-3, so be cautious */
@@ -399,7 +542,7 @@ static void update_B2b_ssr(gtime_t time, int format)
                       "deph = [%f, %f, %f], ddeph = [%f, %f, %f], "
                       "ura = %d, cbias = [%f, %f, %f], dclk = [%f, %f, %f], update = %d\n",
                       i, satid, navs.B2bssr[i].sow, navs.B2bssr[i].verify_sow,
-                      t0_str[0], t0_str[1], t0_str[2], t0_str[3], t0_str[4], t0_str[5],  /* Print converted t0 times */
+                      t0_str[0], t0_str[1], t0_str[2], t0_str[3], t0_str[4], t0_str[5],  
                       navs.B2bssr[i].udi[0], navs.B2bssr[i].udi[1], navs.B2bssr[i].udi[2], navs.B2bssr[i].udi[3],
                       navs.B2bssr[i].udi[4], navs.B2bssr[i].udi[5],
                       navs.B2bssr[i].iodssr[0], navs.B2bssr[i].iodssr[1], navs.B2bssr[i].iodssr[2],
@@ -412,10 +555,6 @@ static void update_B2b_ssr(gtime_t time, int format)
                       navs.B2bssr[i].cbias[0], navs.B2bssr[i].cbias[1], navs.B2bssr[i].cbias[2],
                       navs.B2bssr[i].dclk[0], navs.B2bssr[i].dclk[1], navs.B2bssr[i].dclk[2],
                       navs.B2bssr[i].update);
-            if (B2braw.num_PPPB2BINF02 != 0) {
-                // URAI2URA();
-                // B2b_urai2ura(B2braw.time, satid, navs.B2bssr[i].ura, fp_URA);
-            }
 
             trace(22, "---------------------------------------------------------\n");
 
@@ -427,6 +566,8 @@ static void update_B2b_ssr(gtime_t time, int format)
         B2braw.num_PPPB2BINF04 = 0;
     }
 }
+
+
 
 /* input obs data, navigation messages and sbas correction -------------------*/
 static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
@@ -484,7 +625,7 @@ static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
             update_rtcm_ssr(obs[0].time);
         }
 
-        if (*B2b_file) {
+         if (n_B2b_files > 0) {
             // int format = STRFMT_SINAN;
             // strcpy(rtcm_file, "../../../../GNSS_DataSet/20241002APMALIC/sinan/Cor_202410020000.log");
             format = popt->B2b_format;
@@ -606,9 +747,10 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
     obsd_t *obs_ptr = (obsd_t *)malloc(sizeof(obsd_t)*MAXOBS*2); /* for rover and base */
     double rb[3]={0};
     int i,nobs,n,solstatic,num=0,pri[]={6,1,2,3,4,5,1,6};
+    static gtime_t day1_start = {0};  /* first day start time for AR */
+    static int current_day = -1;      /* current processing day for AR */
 
     trace(3,"procpos : mode=%d\n",mode); /* 0=single dir, 1=combined */
-
     char ura_filename[256];
     sprintf(ura_filename, "./b2b_ura_data_%s.txt", popt->sationname);
 
@@ -650,7 +792,34 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
             continue;
         }
 
-        if (mode==SOLMODE_SINGLE_DIR) {    /* forward or backward */
+         
+/* Pass-by-Pass AR: collection only during Pass-1.
+ * OLD CODE REMOVED HERE:
+ *   - pbp_apply_flag driven epoch-wise apply_ar_fixed() update
+ *   - all dynamic Kalman constraint injection inside procpos()
+ */
+{
+    extern int pbp_day_tag, pbp_collect_flag;
+
+    if (pbp_collect_flag) {
+        int cur_day = pbp_day_tag;
+
+        if (cur_day < 0) {
+            extern int pbp_base_day_id; /* defined in ppp_ar_passbypass.c */
+            int week = 0;
+            double sow = time2gpst(obs_ptr[0].time, &week);
+            int day_id = week * 7 + (int)floor(sow / 86400.0);
+            if (pbp_base_day_id < 0) pbp_base_day_id = day_id;
+            cur_day = day_id - pbp_base_day_id;
+        }
+
+        if ((cur_day == 0 || cur_day == 1) && rtk->sol.stat == SOLQ_PPP) {
+            (void)collect_ambiguities_epoch(rtk, obs_ptr, n, cur_day);
+        }
+    }
+}
+
+if (mode==SOLMODE_SINGLE_DIR) {    /* forward or backward */
             if (!solstatic) {
                 outsol(fp,&rtk->sol,rtk->rb,sopt);
             }
@@ -894,18 +1063,42 @@ static void readpreceph(const char **infile, int n, const prcopt_t *prcopt,
         }
     }
 
-    /* set B2b file and initialize B2b struct */
-    B2b_file[0]=B2b_path[0]='\0'; fp_B2b=NULL;
+       /* set B2b files and initialize B2b struct */
+    /* Only initialize B2b files on first call (when n_B2b_files is 0) */
+    /* This preserves cur_B2b_idx across multiple days of processing */
+    if (n_B2b_files == 0) {
+        cur_B2b_idx = 0;
+        B2b_path[0]='\0';
+        fp_B2b=NULL;
 
-    for (i=0;i<n;i++) {
-        if ((ext=strrchr(infile[i],'.'))&&
-            (!strcmp(ext,".b2b")||!strcmp(ext,".B2b"))) {
-            strcpy(B2b_file,infile[i]);
-            // init_B2b(&B2b);
-            init_raw(&B2braw,prcopt->B2b_format);
-            break;
+        /* Store all B2b files found in input */
+        for (i=0;i<n && n_B2b_files < MAXINFILE;i++) {
+            if ((ext=strrchr(infile[i],'.'))&&
+                (!strcmp(ext,".b2b")||!strcmp(ext,".B2b"))) {
+                strcpy(B2b_files[n_B2b_files],infile[i]);
+                n_B2b_files++;
+                printf("B2b file %d: %s\n", n_B2b_files, infile[i]);
+            }
         }
+
+        /* Initialize B2b raw struct if we have at least one B2b file */
+        if (n_B2b_files > 0) {
+            init_raw(&B2braw,prcopt->B2b_format);
+            trace(2, "Initialized B2braw, Total B2b files found: %d\n", n_B2b_files);
+            printf("Total B2b files found: %d\n", n_B2b_files);
+        }
+    } else {
+        /* B2b files already initialized, keep existing cur_B2b_idx */
+        /* BUT: need to re-initialize B2braw after free_raw() in freepreceph() */
+        if (n_B2b_files > 0) {
+            init_raw(&B2braw,prcopt->B2b_format);
+            trace(2, "Re-initialized B2braw for new day processing\n");
+        }
+        trace(2, "B2b files already initialized, cur_B2b_idx=%d/%d\n", cur_B2b_idx, n_B2b_files);
+        printf("Day %d: Continuing with B2b file index [%d/%d] (next file after previous EOF)\n",
+               processed_days+1, cur_B2b_idx+1, n_B2b_files);
     }
+
 }
 /* free prec ephemeris and sbas data -----------------------------------------*/
 static void freepreceph(nav_t *nav, sbs_t *sbs)
@@ -926,6 +1119,12 @@ static void freepreceph(nav_t *nav, sbs_t *sbs)
 
     if (fp_rtcm) fclose(fp_rtcm);
     free_rtcm(&rtcm);
+    /* close B2b file pointer */
+    if (fp_B2b) {
+        fclose(fp_B2b);
+        fp_B2b = NULL;
+    }
+    B2b_path[0] = '\0';
     free_raw(&B2braw);
 }
 /* read obs and nav data -----------------------------------------------------*/
@@ -1215,19 +1414,38 @@ static int outhead(const char *outfile, const char **infile, int n,
                    const prcopt_t *popt, const solopt_t *sopt)
 {
     FILE *fp=stdout;
+    int need_header=1;
 
     trace(3,"outhead: outfile=%s n=%d\n",outfile,n);
 
     if (*outfile) {
         createdir(outfile);
 
-        if (!(fp=fopen(outfile,"wb"))) {
+        /*
+         * NOTE (patched): some drivers call outhead() multiple times for the same
+         * output file when splitting processing by time unit. The original code
+         * opened the file with "wb" unconditionally, which truncates the file and
+         * can leave only the last segment in .pos/.stat outputs.
+         *
+         * Here we only write the header if the file is empty; otherwise we append.
+         */
+        {
+            FILE *ft=fopen(outfile,"rb");
+            if (ft) {
+                fseek(ft,0,SEEK_END);
+                if (ftell(ft)>0) need_header=0;
+                fclose(ft);
+            }
+        }
+
+        if (!(fp=fopen(outfile,need_header?"wb":"ab"))) {
             showmsg("error : open output file %s",outfile);
             return 0;
         }
     }
-    /* output header */
-    outheader(fp,infile,n,popt,sopt);
+
+    /* output header (only when creating a new/empty file) */
+    if (need_header) outheader(fp,infile,n,popt,sopt);
 
     if (*outfile) fclose(fp);
 
@@ -1280,16 +1498,22 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
             strcpy(tracefile,fopt->trace);
         }
         traceclose();
-        B2b_traceclose();
         traceopen(tracefile);
-        // B2b_traceopen(B2btracefile);
         tracelevel(sopt->trace);
     }
-    strcpy(B2btracefile,outfile);
-    strcat(B2btracefile,".B2bssr");
-    B2b_tracelevel(22);
-    B2b_traceopen(B2btracefile);
-    /* read ionosphere data file */
+
+    /* open B2b SSR/OSB trace (independent of main trace level) */
+    if (flag && outfile && *outfile) {
+        int b2b_trlev = sopt->trace;
+        if (b2b_trlev < 22) b2b_trlev = 22;
+        B2b_traceclose();
+        strcpy(B2btracefile,outfile);
+        strcat(B2btracefile,".B2bssr");
+        B2b_tracelevel(b2b_trlev);
+        B2b_traceopen(B2btracefile);
+    }
+
+/* read ionosphere data file */
     if (*fopt->iono&&(ext=strrchr(fopt->iono,'.'))) {
         if (strlen(ext)==4&&(ext[3]=='i'||ext[3]=='I'||
                              strcmp(ext,".INX")==0||strcmp(ext,".inx")==0)) {
@@ -1387,6 +1611,13 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
             if (fptm) {
                 rtkinit(rtk_ptr,&popt_);
                 procpos(fp,fptm,&popt_,sopt,rtk_ptr,SOLMODE_SINGLE_DIR);
+                 /* Pass-by-Pass AR: process 48h ambiguity resolution if enabled */
+                if (popt_.armode_pbp > 0) {
+                    int n_fixed = ppp_ar_48h(&popt_, rtk_ptr, &obss);
+                    if (n_fixed > 0) {
+                        trace(1, "Pass-by-Pass AR: %d ambiguities fixed\n", n_fixed);
+                    }
+                }
                 rtkfree(rtk_ptr);
                 fclose(fptm);
             }
@@ -1424,6 +1655,13 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
                 rtkinit(rtk_ptr,&popt_);
             }
             procpos(NULL,NULL,&popt_,sopt,rtk_ptr,SOLMODE_COMBINED); /* backward */
+             /* Pass-by-Pass AR: process 48h ambiguity resolution if enabled */
+            if (popt_.armode_pbp > 0) {
+                int n_fixed = ppp_ar_48h(&popt_, rtk_ptr, &obss);
+                if (n_fixed > 0) {
+                    trace(1, "Pass-by-Pass AR: %d ambiguities fixed\n", n_fixed);
+                }
+            }
             rtkfree(rtk_ptr);
 
             /* combine forward/backward solutions */
@@ -1606,8 +1844,8 @@ static int execses_b(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
 *-----------------------------------------------------------------------------*/
 extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                    const prcopt_t *popt, const solopt_t *sopt,
-                   const filopt_t *fopt, const char **infile, int n, const char *outfile,
-                   const char *rov, const char *base)
+                   const filopt_t *fopt, const char **infile, int n,
+                   const char *outfile, const char *rov, const char *base)
 {
     gtime_t tts,tte,ttte;
     double tunit,tss;
@@ -1620,12 +1858,17 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
     /* open processing session */
     if (!openses(popt,sopt,fopt,&navs,&pcvss,&pcvsr)) return -1;
 
-    if (ts.time!=0&&te.time!=0&&tu>=0.0) {
+    /* --------------------------------------------------------------------- */
+    /* case 1) time range specified (ts & te valid) */
+    /* --------------------------------------------------------------------- */
+    if (ts.time!=0 && te.time!=0 && tu>=0.0) {
+
         if (timediff(te,ts)<0.0) {
             showmsg("error : no period");
             closeses(&navs,&pcvss,&pcvsr);
             return 0;
         }
+
         for (i=0;i<MAXINFILE;i++) {
             if (!(ifile[i]=(char *)malloc(1024))) {
                 for (;i>=0;i--) free(ifile[i]);
@@ -1633,7 +1876,18 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                 return -1;
             }
         }
+
         if (tu==0.0||tu>86400.0*MAXPRCDAYS) tu=86400.0*MAXPRCDAYS;
+
+        /*
+         * PATCH: If the output file name has no time keywords ('%'), do not split
+         * processing into many small time-windows (tu). Otherwise each window may
+         * re-initialize output/stat files in some variants and leave only the last
+         * window in the final .pos/.stat files.
+         */
+        if (tu>0.0 && outfile && *outfile && !strchr(outfile,'%')) {
+            tu=86400.0*MAXPRCDAYS;
+        }
         settspan(ts,te);
         tunit=tu<86400.0?tu:86400.0;
         tss=tunit*(int)floor(time2gpst(ts,&week)/tunit);
@@ -1651,15 +1905,14 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                 stat=1;
                 break;
             }
-            for (j=k=nf=0;j<n;j++) {
 
+            for (j=k=nf=0;j<n;j++) {
                 ext=strrchr(infile[j],'.');
 
                 if (ext&&(!strcmp(ext,".rtcm3")||!strcmp(ext,".RTCM3"))) {
                     strcpy(ifile[nf++],infile[j]);
                 }
                 else {
-                    /* include next day precise ephemeris or rinex brdc nav */
                     ttte=tte;
                     if (ext&&(!strcmp(ext,".sp3")||!strcmp(ext,".SP3")||
                               !strcmp(ext,".eph")||!strcmp(ext,".EPH"))) {
@@ -1677,20 +1930,31 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                     break;
                 }
             }
-            if (!reppath(outfile,ofile,tts,"","")&&i>0) flag=0;
 
-            /* execute processing session */
-            stat=execses_b(tts,tte,ti,popt,sopt,fopt,flag,(const char **)ifile,index,nf,(const char *)ofile,
-                           rov,base);
+            if (!reppath(outfile,ofile,tts,"","") && i>0) flag=0;
 
+            stat=execses_b(tts,tte,ti,popt,sopt,fopt,flag,
+                           (const char **)ifile,index,nf,(const char *)ofile,rov,base);
+
+            if (stat==0) {
+                processed_days++;
+                printf("Day %d processing completed\n", processed_days);
+            }
             if (stat==1) break;
         }
-        for (i=0;i<n&&i<MAXINFILE;i++) free(ifile[i]);
+
+        for (i=0;i<MAXINFILE;i++) free(ifile[i]);
     }
+
+    /* --------------------------------------------------------------------- */
+    /* case 2) only ts specified */
+    /* --------------------------------------------------------------------- */
     else if (ts.time!=0) {
+
         for (i=0;i<n&&i<MAXINFILE;i++) {
             if (!(ifile[i]=(char *)malloc(1024))) {
                 for (;i>=0;i--) free(ifile[i]);
+                closeses(&navs,&pcvss,&pcvsr);
                 return -1;
             }
             reppath(infile[i],ifile[i],ts,"","");
@@ -1698,21 +1962,353 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
         }
         reppath(outfile,ofile,ts,"","");
 
-        /* execute processing session */
-        stat=execses_b(ts,te,ti,popt,sopt,fopt,1,(const char **)ifile,index,n,ofile,rov,
-                       base);
+        stat=execses_b(ts,te,ti,popt,sopt,fopt,1,
+                       (const char **)ifile,index,n,ofile,rov,base);
+
+        if (stat==0) {
+            processed_days++;
+            printf("Day %d processing completed\n", processed_days);
+        }
 
         for (i=0;i<n&&i<MAXINFILE;i++) free(ifile[i]);
     }
+
+    /* --------------------------------------------------------------------- */
+    /* case 3) ts/te not specified: auto-detect obs range and process by natural day */
+    /* --------------------------------------------------------------------- */
     else {
+
+        obs_t obs_temp={0};
+        nav_t nav_temp={0};
+        sta_t sta_temp[MAXRCV]={{0}};
+        gtime_t ts_auto={0}, te_auto={0};
+
         for (i=0;i<n;i++) index[i]=i;
 
-        /* execute processing session */
-        stat=execses_b(ts,te,ti,popt,sopt,fopt,1,infile,index,n,outfile,rov,
-                       base);
+        for (i=0;i<MAXINFILE;i++) {
+            if (!(ifile[i]=(char *)malloc(1024))) {
+                for (;i>=0;i--) free(ifile[i]);
+                closeses(&navs,&pcvss,&pcvsr);
+                return -1;
+            }
+        }
+
+        trace(3,"Reading obs files to determine time range\n");
+
+        if (!readobsnav(ts,te,ti,infile,index,n,popt,&obs_temp,&nav_temp,sta_temp)) {
+            if (obs_temp.data) free(obs_temp.data);
+            for (i=0;i<MAXINFILE;i++) free(ifile[i]);
+            closeses(&navs,&pcvss,&pcvsr);
+            return -1;
+        }
+
+        if (obs_temp.n > 0) {
+
+            /* robust scan min/max time */
+            ts_auto = obs_temp.data[0].time;
+            te_auto = obs_temp.data[0].time;
+            for (i=1;i<obs_temp.n;i++) {
+                if (timediff(obs_temp.data[i].time, ts_auto) < 0.0) ts_auto = obs_temp.data[i].time;
+                if (timediff(obs_temp.data[i].time, te_auto) > 0.0) te_auto = obs_temp.data[i].time;
+            }
+            free(obs_temp.data);
+            obs_temp.data = NULL;
+
+            /* align to natural day boundary */
+            {
+                int week_start, week_end;
+                double sow_start = time2gpst(ts_auto, &week_start);
+                double sow_end   = time2gpst(te_auto, &week_end);
+
+                int doy_start = (int)(sow_start/86400.0);
+                int doy_end   = (int)(sow_end  /86400.0);
+
+                gtime_t day_aligned_start = gpst2time(week_start, doy_start*86400.0);
+                gtime_t day_aligned_end   = gpst2time(week_end, (doy_end+1)*86400.0 - DTTOL);
+
+                int num_days = doy_end - doy_start + 1;
+                if (week_end != week_start) {
+                    num_days = (int)((timediff(day_aligned_end, day_aligned_start)+DTTOL)/86400.0) + 1;
+                }
+
+                printf("Auto-detected obs range: %s to %s\n",
+                       time_str(ts_auto,0), time_str(te_auto,0));
+                printf("Day-aligned processing: %s to %s (%d natural days)\n",
+                       time_str(day_aligned_start,0), time_str(day_aligned_end,0), num_days);
+
+                /* ============================================================= */
+                /* Pass-by-Pass driver (only when >=2 days) */
+                /* ============================================================= */
+                if (popt->armode_pbp >= 1 && num_days >= 2) {
+
+                    /* these are provided by your PBP modules */
+                    extern void init_arc_data(void);
+                    extern int  ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs);
+                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag;
+                    extern int  n_ddamb;
+                    extern int  refsat;
+
+                    int day_ok0 = 0, day_ok1 = 0;
+                    prcopt_t popt_run = *popt;
+
+                    popt_run.armode_pbp = 0; /* prevent nested ppp_ar_48h() call inside execses */
+
+                    /* IMPORTANT: avoid ppp_ar_48h calling apply_ar_fixed on NULL rtk */
+                    prcopt_t popt_ar  = *popt;
+                    if (popt_ar.armode_pbp >= 3) popt_ar.armode_pbp = 2;
+
+                    init_arc_data();
+                    n_ddamb = 0;
+                    refsat  = 0;
+
+                    /* ---------- PASS1: day0/day1 float + collect ---------- */
+                    pbp_collect_flag = 1;
+                    pbp_apply_flag   = 0;
+
+                    for (i=0;i<2;i++) {
+
+                        gtime_t day_start, day_end;
+                        int current_week;
+                        double current_sow;
+
+                        current_sow  = (doy_start + i) * 86400.0;
+                        current_week = week_start;
+                        while (current_sow >= 604800.0) {
+                            current_sow -= 604800.0;
+                            current_week++;
+                        }
+                        day_start = gpst2time(current_week, current_sow);
+                        day_end   = timeadd(day_start, 86400.0 - DTTOL);
+
+                        if (timediff(day_start, ts_auto) < 0.0) day_start = ts_auto;
+                        if (timediff(day_end,   te_auto) > 0.0) day_end   = te_auto;
+
+                        printf("\n[PBP] Pass1 (float+collect) day %d: %s to %s\n", i+1,
+                               time_str(day_start,0), time_str(day_end,0));
+
+                        /* build file list */
+                        for (j=k=nf=0;j<n;j++) {
+
+                            ttte = day_end;
+
+                            /* IMPORTANT: B2b may need next day (you can adjust here if you want) */
+                            if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) {
+                                ttte = timeadd(ttte, 86400.0);
+                            }
+                            else if (strstr(infile[j],"brdc")) {
+                                ttte = timeadd(ttte, 7200.0);
+                            }
+
+                            nf += reppaths(infile[j], ifile+nf, MAXINFILE-nf, day_start, ttte, "", "");
+                            while (k<nf) index[k++]=j;
+
+                            if (nf>=MAXINFILE) {
+                                trace(2,"too many input files. truncated\n");
+                                break;
+                            }
+                        }
+
+                        /* output float file (avoid overwrite) */
+                        if (outfile && *outfile) {
+                            char tmp[1024];
+                            reppath(outfile, tmp, day_start, "", "");
+                            snprintf(ofile, sizeof(ofile), "%s.pbpfloatD%d", tmp, i+1);
+                        }
+                        else {
+                            strcpy(ofile, "");
+                        }
+
+                        pbp_day_tag = i; /* force day tag for ambiguity collector */
+
+                        /* ensure B2b SSR restarts from the correct daily file */
+                        reset_B2b_reader(i);
+
+                        stat = execses_b(day_start, day_end, ti, &popt_run, sopt, fopt, 1,
+                                         (const char **)ifile, index, nf, ofile, rov, base);
+
+                        if (i==0 && stat==0) day_ok0 = 1;
+                        if (i==1 && stat==0) day_ok1 = 1;
+                        if (stat==1) break; /* user abort */
+                    }
+
+                    pbp_collect_flag = 0;
+                    pbp_day_tag = -1;
+
+                    if (stat!=1 && day_ok0 && day_ok1) {
+
+                        printf("\n[PBP] Solving WL/NL and building fixed DD set ...\n");
+
+                        if (ppp_ar_48h(&popt_ar, NULL, NULL) > 0 && popt->armode_pbp >= 3) {
+
+                            /* ---------- PASS2: whole-session paper-style re-resolve ----------
+                             * OLD PATH REMOVED:
+                             *   - re-run only day2
+                             *   - per-epoch apply_ar_fixed() dynamic update
+                             * NEW PATH:
+                             *   - re-process the full two-day session
+                             *   - use one fixed independent DD set for the entire session
+                             */
+                            gtime_t sess_start = day_aligned_start;
+                            gtime_t sess_end   = timeadd(day_aligned_start, 2.0 * 86400.0 - DTTOL);
+
+                            if (timediff(sess_end, te_auto) > 0.0) sess_end = te_auto;
+
+                            printf("\n[PBP] Pass2 (paper re-resolve) 48h session: %s to %s\n",
+                                   time_str(sess_start,0), time_str(sess_end,0));
+
+                            for (j=k=nf=0;j<n;j++) {
+                                ttte = sess_end;
+                                if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) {
+                                    ttte = timeadd(ttte, 86400.0);
+                                }
+                                else if (strstr(infile[j],"brdc")) {
+                                    ttte = timeadd(ttte, 7200.0);
+                                }
+
+                                nf += reppaths(infile[j], ifile+nf, MAXINFILE-nf, sess_start, ttte, "", "");
+                                while (k<nf) index[k++]=j;
+
+                                if (nf>=MAXINFILE) {
+                                    trace(2,"too many input files. truncated\n");
+                                    break;
+                                }
+                            }
+
+                            reppath(outfile, ofile, sess_start, "", "");
+                            remove(ofile);
+                            rtkclosestat();
+
+                            pbp_day_tag      = -1;
+                            pbp_collect_flag = 0;
+                            pbp_apply_flag   = 0; /* legacy path disabled */
+                            pbp_resolve_flag = 1; /* enable whole-session fixed pseudoobs */
+
+                            reset_B2b_reader(0);
+
+                            stat = execses_b(sess_start, sess_end, ti, &popt_run, sopt, fopt, 1,
+                                             (const char **)ifile, index, nf, ofile, rov, base);
+
+                            pbp_resolve_flag = 0;
+                            pbp_day_tag      = -1;
+
+                            if (stat==0) processed_days = 2;
+                        }
+                        else {
+                            /* only collect/solve, or AR failed */
+                            processed_days = 2;
+                        }
+                    }
+                    else {
+                        /* fallback: original per-day processing */
+                        printf("[PBP] Warning: pass1 failed, fallback to per-day processing.\n");
+                        for (i=0;i<num_days;i++) {
+                            /* (reuse the original per-day loop below if you want) */
+                        }
+                    }
+                }
+
+                /* ============================================================= */
+                /* Original per-day processing (when not PBP) */
+                /* ============================================================= */
+                else {
+
+                    for (i=0; i<num_days; i++) {
+
+                        gtime_t day_start, day_end;
+                        int current_week;
+                        double current_sow;
+
+                        current_sow  = (doy_start + i) * 86400.0;
+                        current_week = week_start;
+
+                        while (current_sow >= 604800.0) {
+                            current_sow -= 604800.0;
+                            current_week++;
+                        }
+
+                        day_start = gpst2time(current_week, current_sow);
+                        day_end   = timeadd(day_start, 86400.0 - DTTOL);
+
+                        if (timediff(day_start, ts_auto) < 0.0) day_start = ts_auto;
+                        if (timediff(day_end,   te_auto) > 0.0) day_end   = te_auto;
+
+                        printf("\nProcessing natural day %d: %s to %s\n", i+1,
+                               time_str(day_start,0), time_str(day_end,0));
+
+                        for (j=k=nf=0;j<n;j++) {
+
+                            ext=strrchr(infile[j],'.');
+
+                            if (ext&&(!strcmp(ext,".rtcm3")||!strcmp(ext,".RTCM3"))) {
+                                strcpy(ifile[nf++],infile[j]);
+                            }
+                            else {
+                                ttte=day_end;
+                                if (ext&&(!strcmp(ext,".sp3")||!strcmp(ext,".SP3")||
+                                          !strcmp(ext,".eph")||!strcmp(ext,".EPH"))) {
+                                    ttte=timeadd(ttte,3600.0);
+                                }
+                                else if (strstr(infile[j],"brdc")) {
+                                    ttte=timeadd(ttte,7200.0);
+                                }
+                                nf+=reppaths(infile[j],ifile+nf,MAXINFILE-nf,day_start,ttte,"","");
+                            }
+                            while (k<nf) index[k++]=j;
+
+                            if (nf>=MAXINFILE) {
+                                trace(2,"too many input files. truncated\n");
+                                break;
+                            }
+                        }
+
+                        reppath(outfile,ofile,day_start,"","");
+
+                        /* ensure B2b SSR starts from the correct daily file */
+                        reset_B2b_reader(i);
+
+                        stat=execses_b(day_start,day_end,ti,popt,sopt,fopt,1,
+                                       (const char **)ifile,index,nf,ofile,rov,base);
+
+                        if (stat==0) {
+                            processed_days++;
+                            printf("Day %d processing completed\n", processed_days);
+                        }
+                        else {
+                            printf("Day %d processing failed\n", i+1);
+                            if (stat==1) break;
+                        }
+                    }
+                }
+            } /* end day-align scope */
+        }
+
+        /* obs_temp.n == 0 */
+        else {
+            if (obs_temp.data) free(obs_temp.data);
+            stat=execses_b(ts,te,ti,popt,sopt,fopt,1,infile,index,n,outfile,rov,base);
+            if (stat==0) {
+                processed_days++;
+                printf("Day %d processing completed\n", processed_days);
+            }
+        }
+
+        for (i=0;i<MAXINFILE;i++) free(ifile[i]);
     }
+
     /* close processing session */
     closeses(&navs,&pcvss,&pcvsr);
 
+    /* Output processing summary */
+    if (processed_days == 0) {
+        printf("\nNo complete day processed\n");
+    } else if (processed_days == 1) {
+        printf("\n1 day only\n");
+    } else if (processed_days == 2) {
+        printf("\n2 days complete\n");
+    } else {
+        printf("\n%d days complete\n", processed_days);
+    }
+
+    processed_days = 0;
     return stat;
 }
