@@ -378,13 +378,23 @@ extern int collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n,
         a->te = time;
         a->nobs++;
 
-        /* ── A. IF: always use LAST epoch's float PPP state ─────────────────
-         * [CHANGED from v2: was inverse-variance weighted mean]
-         * Overwrites the arc value every epoch; at arc end this holds the
-         * final Kalman filter estimate for this arc's IF ambiguity.
-         * ─────────────────────────────────────────────────────────────────── */
-        a->N_IF = N_IF;
-        if (var_IF > 0.0) a->var_IF = var_IF;
+            /* ── A. IF: arc-level inverse-variance weighted fusion ───────────────
+         * Using only the last epoch can keep arc variance too large and make
+         * cross-day DD NL fixing over-conservative. Here we fuse epoch IF
+         * estimates by 1/var weights to get a stable arc-level IF and variance.
+         */
+        if (var_IF > 0.0) {
+            if (a->nobs <= 1 || a->var_IF <= 0.0) {
+                a->N_IF   = N_IF;
+                a->var_IF = var_IF;
+            }
+            else {
+                const double w_old = 1.0 / a->var_IF;
+                const double w_new = 1.0 / var_IF;
+                a->N_IF   = (a->N_IF * w_old + N_IF * w_new) / (w_old + w_new);
+                a->var_IF = 1.0 / (w_old + w_new);
+            }
+        }
         /* if var_IF <= 0 (degenerate): keep previous valid variance */
 
         /* ── B. WL: inverse-variance weighted mean of HMW epochs ────────────
