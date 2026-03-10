@@ -128,11 +128,12 @@ static double mw_wl_cycles(const obsd_t *obs)
     double f1, f2, lam_wl, mw_m;
     if (!obs) return 0.0;
     if (!get_dual_freq_pair(obs->sat, &f1, &f2)) return 0.0;
-    if (obs->L[0]==0.0||obs->L[1]==0.0||obs->P[0]==0.0||obs->P[1]==0.0)
+	int frq2 = (obs->L[1] == 0.0) ? 2 : 1;
+    if (obs->L[0]==0.0||obs->L[frq2]==0.0||obs->P[0]==0.0||obs->P[frq2]==0.0)
         return 0.0;
     lam_wl = CLIGHT / (f1 - f2);
-    mw_m = (obs->L[0] - obs->L[1]) * CLIGHT / (f1 - f2)
-          - (f1 * obs->P[0] + f2 * obs->P[1]) / (f1 + f2);
+    mw_m = (obs->L[0] - obs->L[frq2]) * CLIGHT / (f1 - f2)
+          - (f1 * obs->P[0] + f2 * obs->P[frq2]) / (f1 + f2);
     return mw_m / lam_wl;
 }
 
@@ -169,10 +170,10 @@ static double pbp_var_wl_epoch(int sat, int sys, double el,
 {
     double f1, f2, lam_wl;
     double var_L1, var_L2, var_P1, var_P2;
-
+	int frq2 = (obs->L[1] == 0.0) ? 2 : 1;
     if (!obs || !opt) return 0.0;
     if (el <= 0.0) return 0.0;
-    if (obs->L[0]==0.0||obs->L[1]==0.0||obs->P[0]==0.0||obs->P[1]==0.0)
+    if (obs->L[0]==0.0||obs->L[frq2]==0.0||obs->P[0]==0.0||obs->P[frq2]==0.0)
         return 0.0;
     if (!get_dual_freq_pair(sat, &f1, &f2)) return 0.0;
 
