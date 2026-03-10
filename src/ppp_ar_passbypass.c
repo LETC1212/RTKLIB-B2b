@@ -582,6 +582,7 @@ extern int fix_wl_nl_ambiguities(ddamb_t *ddamb, int n_dd)
 
     for (int i = 0; i < n_dd; i++) {
         int fixed = 0;
+        if (ddamb[i].var_DD_WL <= 0.0 || ddamb[i].var_DD_IF <= 0.0) continue;
         double std_wl = sqrt(ddamb[i].var_DD_WL);
         ddamb[i].DD_WL_fix = (double)fix_ambiguity(ddamb[i].DD_WL, std_wl, th_wl, &fixed);
         ddamb[i].fixed_WL  = fixed;
@@ -598,8 +599,7 @@ extern int fix_wl_nl_ambiguities(ddamb_t *ddamb, int n_dd)
 
         ddamb[i].DD_NL = (ddamb[i].DD_IF - beta*lam2*ddamb[i].DD_WL_fix) / C;
         const double k_if = 1.0/C, k_wl = (-beta*lam2)/C;
-        const double var_nl = k_if*k_if*ddamb[i].var_DD_IF
-                            + k_wl*k_wl*ddamb[i].var_DD_WL;
+        const double var_nl = k_if*k_if*ddamb[i].var_DD_IF;
         ddamb[i].var_DD_NL = var_nl;
 
         double std_nl = (var_nl > 0.0) ? sqrt(var_nl) : 1.0;
