@@ -550,6 +550,7 @@ extern int compute_dd_ambiguities(const satamb_t *satamb, int refsat,
     *n_dd = 0;
     int sys_ref = satsys(refsat, NULL);
     if (sys_ref == 0) return 0;
+    if(!pbp_bds_is_sidereal(refsat)&&satsys(refsat,NULL)==SYS_CMP)  return 0;
 
     double SD_WL_ref=0, varSD_WL_ref=0, SD_IF_ref=0, varSD_IF_ref=0;
     int ref_arc0=-1, ref_arc1=-1;
@@ -561,6 +562,7 @@ extern int compute_dd_ambiguities(const satamb_t *satamb, int refsat,
     for (int sat = 1; sat <= MAXSAT; sat++) {
         if (sat == refsat || satamb[sat-1].n <= 0) continue;
         if (satsys(sat, NULL) != sys_ref) continue;
+        if(!pbp_bds_is_sidereal(sat)&&satsys(sat,NULL)==SYS_CMP)  continue;
         double SD_WL_sat=0, varSD_WL_sat=0, SD_IF_sat=0, varSD_IF_sat=0;
         int sat_arc0=-1, sat_arc1=-1;
         if (!compute_sd_across_days(satamb, sat,
@@ -680,6 +682,17 @@ static int pbp_build_arcfix_list(void)
     return pbp_n_arcfix;
 }
 
+extern int pbp_bds_is_sidereal(int sat)
+{
+    int prn = 0;
+    if (satsys(sat, &prn) != SYS_CMP) return 0;
+    if (prn >= 1  && prn <= 10) return 1;   // BDS-2 GEO(1-5) + IGSO(6-10)
+    if (prn == 13 || prn == 16) return 1;   // BDS-2 IGSO
+    if (prn >= 38 && prn <= 40) return 1;   // BDS-3 IGSO
+    if (prn >= 59 && prn <= 62) return 1;   // BDS-3 GEO
+    return 0;                               // MEO 排除
+}
+
 extern void pbp_clear_fixed_constraints(void) { pbp_pb_weight=1e10; pbp_free_arcfix(); }
 extern int  pbp_has_fixed_constraints(void) { return pbp_n_arcfix > 0; }
 
@@ -697,6 +710,40 @@ extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var)
     return 0;
 }
 
+/* ── pbp_store_fixed_constraints ─────────────────────────────────────────────
+ *
+ * Build the NEQ from ALL fixed DD pairs, solve it, then store DAY-0 arc
+ * entries only as tight integer priors for Pass-2.
+ *
+ * ── EARLY-SESSION STEP IN CLOCK DIFFERENCE — root cause and fix ─────────
+ *
+ * The step visible in the inter-station clock difference at the beginning
+ * of the time-transfer series is caused by the `continue` statement in
+ * ppp.c/udbias_ppp that was previously executed for EVERY epoch where
+ * has_fix_arc == 1.  This blocked ALL Kalman measurement updates for
+ * fixed-arc satellites, forcing the receiver clock to absorb 100 % of
+ * the range residuals (position + clock + trop error) during the EKF
+ * convergence period.  The two stations experienced different convergence
+ * trajectories, and their clock difference showed a step.
+ *
+ * FIX (implemented in ppp.c):
+ *   The `continue` is now placed INSIDE the initialisation branch
+ *   (x[j]==0 || slip), so it only executes for the single epoch at
+ *   which the arc is first initialised.  For all subsequent epochs the
+ *   normal Kalman measurement update runs, distributing residuals across
+ *   position, clock, trop AND ambiguity — identical to the float solution.
+ *   The tight integer prior (var_fix = 1e-4 m²) maintained by the EKF
+ *   naturally keeps the ambiguity within ~1 mm of b_fix throughout the
+ *   session without any additional intervention.
+ *
+ * FIX (implemented here in pbp_store_fixed_constraints):
+ *   After the NEQ solve, only day-0 arc entries are retained in the
+ *   arcfix list.  Day-1 entries are used for the cross-day DD constraint
+ *   formulation but are discarded before Pass-2 begins.  This avoids
+ *   any possibility of a spurious second initialisation at the day
+ *   boundary.  var_fix is set to 1e-4 m² = (1 cm)² for all day-0
+ *   entries regardless of the NEQ posterior variance.
+ * ─────────────────────────────────────────────────────────────────────────── */
 extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
 {
     double *N=NULL, *w=NULL, *x=NULL, *Q=NULL;
@@ -710,6 +757,7 @@ extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
     x = zeros(pbp_n_arcfix, 1);
     if (!N || !w || !x) { free(N); free(w); free(x); pbp_clear_fixed_constraints(); return 0; }
 
+    /* Prior: diagonal from float arc variances */
     for (int i = 0; i < pbp_n_arcfix; i++) {
         double var = pbp_arcfix[i].var_float;
         if (var < 1e-8) var = 1e-8;
@@ -717,6 +765,7 @@ extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
         w[i] += pbp_arcfix[i].b_float / var;
     }
 
+    /* Constraints from ALL fixed DD pairs */
     for (int i = 0; i < n_dd; i++) {
         int r0, r1, s0, s1, ir0, ir1, is0, is1;
         double bc, d[4] = {+1.0, -1.0, -1.0, +1.0};
@@ -745,13 +794,34 @@ extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
     for (int i = 0; i < pbp_n_arcfix; i++) {
         pbp_arcfix[i].b_fix   = x[i];
         pbp_arcfix[i].var_fix = Q[i + i*pbp_n_arcfix];
-        if (pbp_arcfix[i].var_fix < 0.01*0.01) pbp_arcfix[i].var_fix = 0.01*0.01;
+        /* Floor: use (1cm)² as minimum regardless of NEQ result */
+        if (pbp_arcfix[i].var_fix < 1e-4) pbp_arcfix[i].var_fix = 1e-4;
         if (pbp_arcfix[i].var_fix > pbp_arcfix[i].var_float)
             pbp_arcfix[i].var_fix = pbp_arcfix[i].var_float;
     }
     free(N); free(w); free(x); free(Q);
+
+    /* Keep only day-0 entries — day-1 entries were needed for the NEQ
+     * cross-day constraint formulation but must not produce a second
+     * initx() call at the day boundary in Pass-2.
+     * var_fix is clamped to exactly 1e-4 m² = (1 cm)² so that the
+     * integer prior is tight enough to constrain the ambiguity but
+     * loose enough to let the EKF measurement updates run naturally. */
+    {
+        int new_n = 0;
+        for (int i = 0; i < pbp_n_arcfix; i++) {
+            if (pbp_arcfix[i].day != 0) continue;   /* discard day-1 */
+            pbp_arcfix[i].var_fix     = 1e-4;        /* (1 cm)^2 integer prior */
+            pbp_arcfix[new_n++] = pbp_arcfix[i];
+        }
+        pbp_n_arcfix = new_n;
+    }
+
+    printf("[PBP] pbp_store_fixed_constraints: %d day-0 arc priors ready for Pass-2\n",
+           pbp_n_arcfix);
     return pbp_n_arcfix;
 }
+
 
 /* ── Legacy link stubs ───────────────────────────────────────────────────── */
 extern int pbp_apply_session_pseudoobs(rtk_t *rtk) { (void)rtk; return 0; }
