@@ -2312,3 +2312,4 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
     processed_days = 0;
     return stat;
 }
+
