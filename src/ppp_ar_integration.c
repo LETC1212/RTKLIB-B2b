@@ -202,6 +202,7 @@ extern int  fix_wl_nl_ambiguities(ddamb_t *ddamb, int n_dd);
 extern void pbp_clear_fixed_constraints(void);
 extern int  pbp_store_fixed_constraints(const ddamb_t *ddamb, int n_dd, double Pb);
 extern int  collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n, int day, satamb_t *satamb);
+extern int pbp_bds_is_sidereal(int sat);
 
 static int select_refsat_auto_sys(const satamb_t *sa, int sys)
 {
@@ -212,10 +213,11 @@ static int select_refsat_auto_sys(const satamb_t *sa, int sys)
         if (satsys(sat, NULL) != sys) continue;
         int has0=0, has1=0, tot=0;
         for (int j = 0; j < sa[i].n; j++) {
+            if(!pbp_bds_is_sidereal(sat)&&satsys(sat,NULL)==SYS_CMP)  continue;
             if (sa[i].arc[j].day==0 && sa[i].arc[j].nobs>=10) { has0=1; tot+=sa[i].arc[j].nobs; }
             if (sa[i].arc[j].day==1 && sa[i].arc[j].nobs>=10) { has1=1; tot+=sa[i].arc[j].nobs; }
         }
-        if (has0 && has1 && tot > max_obs) { max_obs=tot ; ref=sat; }
+        if (has0 && has1 && tot > max_obs) { max_obs=tot; ref=sat; }
     }
     return ref;
 }
@@ -258,6 +260,32 @@ extern int ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs)
     if (ref_gps) { char s[16]=""; satno2id(ref_gps,s); printf("Reference (GPS): %s\n",s); }
     if (ref_cmp) { char s[16]=""; satno2id(ref_cmp,s); printf("Reference (BDS): %s\n",s); }
 
+    /* BDS arc diagnostic: print every BDS satellite's arc info to stderr */
+    if (ref_cmp == 0) {
+        fprintf(stderr, "[PBP] WARNING: No BDS reference satellite found!\n");
+        fprintf(stderr, "[PBP] BDS arc summary:\n");
+        for (int i = 0; i < MAXSAT; i++) {
+            if (satamb[i].n == 0) continue;
+            int sat = i+1;
+            if (satsys(sat, NULL) != SYS_CMP) continue;
+            char sid[8]=""; satno2id(sat, sid);
+            int has0=0, has1=0;
+            for (int j = 0; j < satamb[i].n; j++) {
+                if (satamb[i].arc[j].day==0 && satamb[i].arc[j].nobs>=10) has0=1;
+                if (satamb[i].arc[j].day==1 && satamb[i].arc[j].nobs>=10) has1=1;
+            }
+            fprintf(stderr, "[PBP]   %s: %d arcs  has_day0=%d has_day1=%d\n",
+                    sid, satamb[i].n, has0, has1);
+            for (int j = 0; j < satamb[i].n; j++) {
+                fprintf(stderr, "[PBP]     arc%d: day=%d nobs=%d "
+                        "N_WL=%.3f var_WL=%.6f N_IF=%.3f var_IF=%.2e\n",
+                        j, satamb[i].arc[j].day, satamb[i].arc[j].nobs,
+                        satamb[i].arc[j].N_WL, satamb[i].arc[j].var_WL,
+                        satamb[i].arc[j].N_IF, satamb[i].arc[j].var_IF);
+            }
+        }
+    }
+
     /* diagnostic file */
     char cwd[PATH_MAX]="", ddpath[PATH_MAX]="pbp_dd_wlnl.txt";
     if (!getcwd(cwd,sizeof(cwd))) strncpy(cwd,".",sizeof(cwd)-1);
@@ -270,6 +298,7 @@ extern int ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs)
         fprintf(fpdd,"# PBP arc-level DD WL/NL (day0-day1)\n");
         fprintf(fpdd,"# CWD: %s\n",cwd);
         fprintf(fpdd,"# BDS = sats passing arc-pairing (non-1-day repeat excluded)\n");
+        fflush(fpdd);   /* ensure header is written even if program exits early */
     }
 
     n_ddamb = 0;
