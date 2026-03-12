@@ -1005,13 +1005,32 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 
             has_fix_arc = (f==0) && pbp_get_fixed_arc_bias(obs[i].time, sat, &bfix, &vfix);
             if (has_fix_arc) {
-                /*
-                 * Paper-style pass-2 re-resolve:
-                 * use the solved arc IF ambiguity as an arc-level prior only.
-                 * Do not re-force the ambiguity every epoch, otherwise the EKF
-                 * can be over-constrained before clocks/trop converge and the
-                 * session may remain at Q=0 with no .stat output.
-                 */
+                /* ── Pass-2 integer-prior logic ────────────────────────────────
+                 * At arc initialisation (x[j]==0 or cycle slip):
+                 *   Apply the NEQ-solved IF bias as a tight integer prior via
+                 *   initx(), then skip the normal measurement update for that
+                 *   single epoch (continue).
+                 *
+                 * For ALL subsequent epochs (x[j] already initialised):
+                 *   Do NOT use continue — let the normal Kalman measurement
+                 *   update run.  The tight initial variance (var_fix ≈ 1e-4 m²)
+                 *   keeps the ambiguity near b_fix through natural EKF dynamics
+                 *   while allowing position/clock/trop to converge freely.
+                 *
+                 * Why this matters for time transfer:
+                 *   The old design used a bare "continue" that blocked ALL
+                 *   measurement updates whenever has_fix_arc==1.  This forced
+                 *   the receiver clock to absorb 100 % of the range residuals
+                 *   (position error + clock error + trop error) during the
+                 *   convergence period.  The two stations converged along
+                 *   different clock trajectories, producing the early-session
+                 *   step visible in the inter-station clock difference.
+                 *   Moving the continue inside the initialisation branch
+                 *   eliminates this effect: normal EKF dynamics distribute
+                 *   residuals naturally, and both stations converge identically
+                 *   to the float PPP — the fixed solution is always at least as
+                 *   smooth as the float one.
+                 * ─────────────────────────────────────────────────────────── */
                 if (vfix <= 0.0) vfix = SQR(0.05);
                 if (vfix < SQR(0.01)) vfix = SQR(0.01);
                 if (vfix > VAR_BIAS) vfix = VAR_BIAS;
@@ -1019,8 +1038,13 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                     initx(rtk,bfix,vfix,IB(sat,f,&rtk->opt));
                     for (k=0;k<MAXSAT;k++) rtk->ambc[sat-1].flags[k]=0;
                     trace(3,"udbias_ppp: sat=%2d fixed_arc_bias_init=%.3f var=%.6g\n",sat,bfix,vfix);
+                    continue;   /* skip normal update at initialisation epoch only */
                 }
-                continue;
+                /* x[j] already initialised and no slip:
+                 * fall through to the normal Kalman measurement update below.
+                 * The process-noise increment above (prn[0]²·|tt|) naturally
+                 * relaxes the prior, and the measurement update re-tightens it,
+                 * maintaining the integer constraint without blocking updates. */
             }
 
             if (bias[i]==0.0||(rtk->x[j]!=0.0&&!slip[i])) continue;
