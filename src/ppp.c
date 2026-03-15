@@ -67,6 +67,9 @@ extern int pbp_resolve_flag;
 extern int pbp_has_fixed_constraints(void);
 extern int pbp_apply_session_pseudoobs(rtk_t *rtk); /* legacy no-op */
 extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var);
+extern int pbp_neq_accum_flag;
+extern int pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n, const double *v, const double *H, const double *R, int nv);
+extern int pbp_get_fixed_clock(gtime_t t, int sys_idx, double *clk);
 #define SQR(x)      ((x)*(x))
 #define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
 #define MAX(x,y)    ((x)>(y)?(x):(y))
@@ -181,6 +184,19 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 
     /* receiver clocks */
     i = IC(0, &rtk->opt);
+    if (pbp_resolve_flag) {
+        double ctmp=0.0;
+        if (pbp_get_fixed_clock(rtk->sol.time,0,&ctmp)) x[i]=ctmp;
+        if (pbp_get_fixed_clock(rtk->sol.time,1,&ctmp)) x[i+1]=ctmp;
+        if (pbp_get_fixed_clock(rtk->sol.time,2,&ctmp)) x[i+2]=ctmp;
+        if (pbp_get_fixed_clock(rtk->sol.time,3,&ctmp)) x[i+3]=ctmp;
+#ifdef ENAIRN
+        if (pbp_get_fixed_clock(rtk->sol.time,4,&ctmp)) x[i+4]=ctmp;
+#endif
+#ifdef BDS2BDS3
+        if (pbp_get_fixed_clock(rtk->sol.time,NSYS,&ctmp)) x[i+NSYS]=ctmp;
+#endif
+    }
 #ifdef ENAIRN
 #ifdef BDS2BDS3
     /* output all 6 systems: GPS, GLO, GAL, BDS2, IRN, BDS3 */
@@ -979,8 +995,8 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                     ion=(obs[i].P[0]-obs[i].P[f])/(1.0-SQR(freq1/freq2));
                 bias[i]=L[f]-P[f]+2.0*ion*SQR(freq1/freq2);
             }
-            has_fix_arc = (f==0) && pbp_get_fixed_arc_bias(obs[i].time, sat, &bfix, &vfix);
-            if (has_fix_arc) continue; /* do not let phase-code jump offset drag fixed arcs */
+            has_fix_arc = 0;
+            if (has_fix_arc) continue; /* removed arc-level IF prior path */
             if (rtk->x[j]==0.0||slip[i]||bias[i]==0.0) continue;
 
             offset+=bias[i]-rtk->x[j];
@@ -1003,7 +1019,7 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 
             rtk->P[j+j*rtk->nx]+=SQR(rtk->opt.prn[0])*fabs(rtk->tt);
 
-            has_fix_arc = (f==0) && pbp_get_fixed_arc_bias(obs[i].time, sat, &bfix, &vfix);
+            has_fix_arc = 0;
             if (has_fix_arc) {
                 /* ── Pass-2 integer-prior logic ────────────────────────────────
                  * At arc initialisation (x[j]==0 or cycle slip):
@@ -1592,6 +1608,10 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	if (stat==SOLQ_PPP) {
 
 		if (ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel)) {
+
+            if (pbp_neq_accum_flag) {
+                (void)pbp_neq_add_epoch(rtk, obs, n, v, H, R, nv);
+            }
 
 			matcpy(rtk->xa,xp,rtk->nx,1);
 			matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
