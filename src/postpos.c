@@ -2044,7 +2044,9 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                     /* these are provided by your PBP modules */
                     extern void init_arc_data(void);
                     extern int  ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs);
-                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag;
+                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag, pbp_neq_accum_flag;
+                    extern int  pbp_neq_init(gtime_t t0, gtime_t t1, double ti, const prcopt_t *opt);
+                    extern int  pbp_finalize_final_neq(void);
                     extern int  n_ddamb;
                     extern int  refsat;
 
@@ -2140,38 +2142,20 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
 
                         if (ppp_ar_48h(&popt_ar, NULL, NULL) > 0 && popt->armode_pbp >= 3) {
 
-                            /* ---------- PASS2: whole-session paper-style re-resolve ----------
-                             * OLD PATH REMOVED:
-                             *   - re-run only day2
-                             *   - per-epoch apply_ar_fixed() dynamic update
-                             * NEW PATH:
-                             *   - re-process the full two-day session
-                             *   - use one fixed independent DD set for the entire session
-                             */
                             gtime_t sess_start = day_aligned_start;
                             gtime_t sess_end   = timeadd(day_aligned_start, 2.0 * 86400.0 - DTTOL);
-
                             if (timediff(sess_end, te_auto) > 0.0) sess_end = te_auto;
 
-                            printf("\n[PBP] Pass2 (paper re-resolve) 48h session: %s to %s\n",
+                            printf("\n[PBP] Pass2 (48h float accumulation for final NEQ): %s to %s\n",
                                    time_str(sess_start,0), time_str(sess_end,0));
 
                             for (j=k=nf=0;j<n;j++) {
                                 ttte = sess_end;
-                                if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) {
-                                    ttte = timeadd(ttte, 86400.0);
-                                }
-                                else if (strstr(infile[j],"brdc")) {
-                                    ttte = timeadd(ttte, 7200.0);
-                                }
-
+                                if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) ttte = timeadd(ttte, 86400.0);
+                                else if (strstr(infile[j],"brdc")) ttte = timeadd(ttte, 7200.0);
                                 nf += reppaths(infile[j], ifile+nf, MAXINFILE-nf, sess_start, ttte, "", "");
                                 while (k<nf) index[k++]=j;
-
-                                if (nf>=MAXINFILE) {
-                                    trace(2,"too many input files. truncated\n");
-                                    break;
-                                }
+                                if (nf>=MAXINFILE) { trace(2,"too many input files. truncated\n"); break; }
                             }
 
                             reppath(outfile, ofile, sess_start, "", "");
@@ -2180,17 +2164,29 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
 
                             pbp_day_tag      = -1;
                             pbp_collect_flag = 0;
-                            pbp_apply_flag   = 0; /* legacy path disabled */
-                            pbp_resolve_flag = 1; /* enable whole-session fixed pseudoobs */
+                            pbp_apply_flag   = 0;
+                            pbp_resolve_flag = 0;
+                            pbp_neq_accum_flag = 0;
+                            (void)pbp_neq_init(sess_start, sess_end, ti, &popt_run);
+                            pbp_neq_accum_flag = 1;
 
                             reset_B2b_reader(0);
-
                             stat = execses_b(sess_start, sess_end, ti, &popt_run, sopt, fopt, 1,
                                              (const char **)ifile, index, nf, ofile, rov, base);
+                            pbp_neq_accum_flag = 0;
 
-                            pbp_resolve_flag = 0;
-                            pbp_day_tag      = -1;
+                            if (stat==0 && pbp_finalize_final_neq()) {
+                                printf("\n[PBP] Pass3 (write fixed clock series from solved NEQ)\n");
+                                remove(ofile);
+                                rtkclosestat();
+                                pbp_resolve_flag = 1;
+                                reset_B2b_reader(0);
+                                stat = execses_b(sess_start, sess_end, ti, &popt_run, sopt, fopt, 1,
+                                                 (const char **)ifile, index, nf, ofile, rov, base);
+                                pbp_resolve_flag = 0;
+                            }
 
+                            pbp_day_tag = -1;
                             if (stat==0) processed_days = 2;
                         }
                         else {
