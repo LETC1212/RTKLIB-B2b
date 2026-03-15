@@ -18,6 +18,10 @@
 #include "rtklib.h"
 #include "ppp_ar_passbypass.h"
 
+#ifndef PBP_MAX2
+#define PBP_MAX2(a,b) (( (a) > (b) ) ? (a) : (b))
+#endif
+
 /* ── Pass-2 epoch diagnostics ─────────────────────────────────────────────── */
 int pbp_epoch_fix_count = 0;
 int pbp_epoch_total     = 0;
@@ -637,191 +641,295 @@ typedef struct {
 static pbp_arcfix_t *pbp_arcfix   = NULL;
 static int           pbp_n_arcfix = 0;
 static double        pbp_pb_weight = 1.0e10;
-int                  pbp_resolve_flag = 0;
 
-static void pbp_free_arcfix(void)
+int                  pbp_resolve_flag = 0;
+int                  pbp_neq_accum_flag = 0;
+
+#define PBP_MAX_ARC_PARAM 512
+#define PBP_MAX_DD_CONSTR 256
+#define PBP_MAX_CLKSYS    8
+
+typedef struct {
+    int sat, day, arc_id, amb_col;
+    gtime_t ts, te;
+} pbp_arc_col_t;
+
+typedef struct {
+    int sat1, sat2;
+    double bc, weight;
+} pbp_ddcon_t;
+
+typedef struct {
+    int n_xyz, n_amb, n_clk_sys, n_clk_epoch, n_ztd, n_total;
+    gtime_t t0, t1; double ti;
+    int n_epoch;
+    double *N, *w, *xhat;
+    gtime_t *epoch_time;
+    int *clock_col; /* [n_epoch * n_clk_sys] */
+    int *ztd_col;   /* [n_ztd * ntrop]        */
+    double *fixed_clk; /* solved clocks for each epoch/system */
+    pbp_arc_col_t arc_cols[PBP_MAX_ARC_PARAM];
+    int n_arc_used;
+    pbp_ddcon_t ddc[PBP_MAX_DD_CONSTR];
+    int n_ddc;
+    int ready;
+} pbp_neq_t;
+
+static pbp_neq_t g_pbp_neq = {0};
+
+static void pbp_neq_free(void)
 {
-    if (pbp_arcfix) free(pbp_arcfix);
-    pbp_arcfix = NULL; pbp_n_arcfix = 0;
+    free(g_pbp_neq.N); g_pbp_neq.N=NULL;
+    free(g_pbp_neq.w); g_pbp_neq.w=NULL;
+    free(g_pbp_neq.xhat); g_pbp_neq.xhat=NULL;
+    free(g_pbp_neq.epoch_time); g_pbp_neq.epoch_time=NULL;
+    free(g_pbp_neq.clock_col); g_pbp_neq.clock_col=NULL;
+    free(g_pbp_neq.ztd_col); g_pbp_neq.ztd_col=NULL;
+    free(g_pbp_neq.fixed_clk); g_pbp_neq.fixed_clk=NULL;
+    memset(&g_pbp_neq,0,sizeof(g_pbp_neq));
 }
 
-static int pbp_find_arcfix(int sat, int arc)
+static int pbp_neq_ntrop(const prcopt_t *opt)
 {
-    for (int i = 0; i < pbp_n_arcfix; i++)
-        if (pbp_arcfix[i].used && pbp_arcfix[i].sat==sat && pbp_arcfix[i].arc==arc)
-            return i;
+    return pbp_NT(opt)>0 ? 1 : 0; /* residual wet delay only */
+}
+
+extern void pbp_clear_fixed_constraints(void)
+{
+    pbp_pb_weight = 1e10;
+    pbp_neq_free();
+}
+extern int pbp_has_fixed_constraints(void) { return g_pbp_neq.ready; }
+
+extern int pbp_neq_init(gtime_t t0, gtime_t t1, double ti, const prcopt_t *opt)
+{
+    int e, s, ntrop;
+    pbp_arc_col_t arc_keep[PBP_MAX_ARC_PARAM];
+    pbp_ddcon_t ddc_keep[PBP_MAX_DD_CONSTR];
+    int n_arc_keep = g_pbp_neq.n_arc_used;
+    int n_ddc_keep = g_pbp_neq.n_ddc;
+    if (n_arc_keep>0) memcpy(arc_keep,g_pbp_neq.arc_cols,sizeof(pbp_arc_col_t)*n_arc_keep);
+    if (n_ddc_keep>0) memcpy(ddc_keep,g_pbp_neq.ddc,sizeof(pbp_ddcon_t)*n_ddc_keep);
+    pbp_neq_free();
+    if (!opt || ti <= 0.0 || timediff(t1,t0) < 0.0) return 0;
+    g_pbp_neq.n_arc_used = n_arc_keep;
+    g_pbp_neq.n_ddc = n_ddc_keep;
+    if (n_arc_keep>0) memcpy(g_pbp_neq.arc_cols,arc_keep,sizeof(pbp_arc_col_t)*n_arc_keep);
+    if (n_ddc_keep>0) memcpy(g_pbp_neq.ddc,ddc_keep,sizeof(pbp_ddcon_t)*n_ddc_keep);
+    g_pbp_neq.t0 = t0; g_pbp_neq.t1 = t1; g_pbp_neq.ti = ti;
+    g_pbp_neq.n_xyz = 3;
+    g_pbp_neq.n_clk_sys = pbp_NC(opt);
+    g_pbp_neq.n_epoch = (int)floor(timediff(t1,t0)/ti + 0.5) + 1;
+    g_pbp_neq.n_clk_epoch = g_pbp_neq.n_epoch * g_pbp_neq.n_clk_sys;
+    g_pbp_neq.n_ztd = (int)floor(timediff(t1,t0)/3600.0 + 1.0) + 1;
+    ntrop = pbp_neq_ntrop(opt);
+    g_pbp_neq.epoch_time = (gtime_t*)calloc((size_t)g_pbp_neq.n_epoch,sizeof(gtime_t));
+    g_pbp_neq.clock_col = (int*)calloc((size_t)g_pbp_neq.n_clk_epoch,sizeof(int));
+    g_pbp_neq.ztd_col   = (int*)calloc((size_t)PBP_MAX2(1,g_pbp_neq.n_ztd*PBP_MAX2(1,ntrop)),sizeof(int));
+    g_pbp_neq.fixed_clk = (double*)calloc((size_t)g_pbp_neq.n_clk_epoch,sizeof(double));
+    if (!g_pbp_neq.epoch_time || !g_pbp_neq.clock_col || !g_pbp_neq.ztd_col || !g_pbp_neq.fixed_clk) {
+        pbp_neq_free(); return 0;
+    }
+    for (e=0;e<g_pbp_neq.n_epoch;e++) g_pbp_neq.epoch_time[e]=timeadd(t0,e*ti);
+    for (e=0;e<g_pbp_neq.n_epoch;e++) for (s=0;s<g_pbp_neq.n_clk_sys;s++)
+        g_pbp_neq.clock_col[e*g_pbp_neq.n_clk_sys+s] = g_pbp_neq.n_xyz + PBP_MAX_ARC_PARAM + e*g_pbp_neq.n_clk_sys + s;
+    for (e=0;e<g_pbp_neq.n_ztd*PBP_MAX2(1,ntrop);e++)
+        g_pbp_neq.ztd_col[e] = g_pbp_neq.n_xyz + PBP_MAX_ARC_PARAM + g_pbp_neq.n_clk_epoch + e;
+    g_pbp_neq.n_total = g_pbp_neq.n_xyz + PBP_MAX_ARC_PARAM + g_pbp_neq.n_clk_epoch + g_pbp_neq.n_ztd*PBP_MAX2(1,ntrop);
+    g_pbp_neq.N = zeros(g_pbp_neq.n_total,g_pbp_neq.n_total);
+    g_pbp_neq.w = zeros(g_pbp_neq.n_total,1);
+    g_pbp_neq.xhat = zeros(g_pbp_neq.n_total,1);
+    if (!g_pbp_neq.N || !g_pbp_neq.w || !g_pbp_neq.xhat) { pbp_neq_free(); return 0; }
+    fprintf(stderr,"[PBP-NEQ] init: epochs=%d clk_sys=%d ztd_blk=%d total=%d\n",
+            g_pbp_neq.n_epoch,g_pbp_neq.n_clk_sys,g_pbp_neq.n_ztd,g_pbp_neq.n_total);
+    return 1;
+}
+
+static int pbp_find_arc_col(int sat, int day, int arc_id)
+{
+    for (int i=0;i<g_pbp_neq.n_arc_used;i++) {
+        if (g_pbp_neq.arc_cols[i].sat==sat && g_pbp_neq.arc_cols[i].day==day && g_pbp_neq.arc_cols[i].arc_id==arc_id)
+            return g_pbp_neq.arc_cols[i].amb_col;
+    }
     return -1;
 }
 
-static int pbp_build_arcfix_list(void)
+extern int pbp_build_arc_columns(void)
 {
-    int n = 0, k = 0;
-    pbp_free_arcfix();
-    for (int s = 1; s <= MAXSAT; s++)
-        for (int j = 0; j < satamb[s-1].n; j++) {
-            const ambarc_t *a = &satamb[s-1].arc[j];
-            if ((a->day!=0&&a->day!=1)||a->nobs<10||a->var_IF<=0.0||a->N_IF==0.0)
-                continue;
-            n++;
+    int k=0;
+    for (int sat=1;sat<=MAXSAT;sat++) {
+        for (int j=0;j<satamb[sat-1].n;j++) {
+            const ambarc_t *a=&satamb[sat-1].arc[j];
+            if ((a->day!=0 && a->day!=1) || a->nobs<10 || a->var_IF<=0.0 || a->N_IF==0.0) continue;
+            if (k>=PBP_MAX_ARC_PARAM) {
+                fprintf(stderr,"[PBP-NEQ] ERROR: arc ambiguity count exceeds %d\n",PBP_MAX_ARC_PARAM);
+                return 0;
+            }
+            g_pbp_neq.arc_cols[k].sat=sat;
+            g_pbp_neq.arc_cols[k].day=a->day;
+            g_pbp_neq.arc_cols[k].arc_id=j;
+            g_pbp_neq.arc_cols[k].ts=a->ts;
+            g_pbp_neq.arc_cols[k].te=a->te;
+            g_pbp_neq.arc_cols[k].amb_col=g_pbp_neq.n_xyz+k;
+            k++;
         }
-    if (n <= 0) return 0;
-    pbp_arcfix = (pbp_arcfix_t *)calloc((size_t)n, sizeof(pbp_arcfix_t));
-    if (!pbp_arcfix) return 0;
-    for (int s = 1; s <= MAXSAT; s++)
-        for (int j = 0; j < satamb[s-1].n; j++) {
-            const ambarc_t *a = &satamb[s-1].arc[j];
-            if ((a->day!=0&&a->day!=1)||a->nobs<10||a->var_IF<=0.0||a->N_IF==0.0)
-                continue;
-            pbp_arcfix[k].sat = s; pbp_arcfix[k].arc = j; pbp_arcfix[k].day = a->day;
-            pbp_arcfix[k].ts = a->ts; pbp_arcfix[k].te = a->te;
-            pbp_arcfix[k].b_float = a->N_IF; pbp_arcfix[k].var_float = a->var_IF;
-            pbp_arcfix[k].b_fix   = a->N_IF; pbp_arcfix[k].var_fix   = a->var_IF;
-            pbp_arcfix[k].used = 1; k++;
-        }
-    pbp_n_arcfix = k;
-    return pbp_n_arcfix;
+    }
+    g_pbp_neq.n_arc_used = k;
+    fprintf(stderr,"[PBP-NEQ] arc ambiguity columns=%d (reserved=%d)\n",k,PBP_MAX_ARC_PARAM);
+    return k>0;
 }
 
-extern int pbp_bds_is_sidereal(int sat)
+static int pbp_epoch_id(gtime_t t)
 {
-    int prn = 0;
-    if (satsys(sat, &prn) != SYS_CMP) return 0;
-    if (prn >= 1  && prn <= 10) return 1;   // BDS-2 GEO(1-5) + IGSO(6-10)
-    if (prn == 13 || prn == 16) return 1;   // BDS-2 IGSO
-    if (prn >= 38 && prn <= 40) return 1;   // BDS-3 IGSO
-    if (prn >= 59 && prn <= 62) return 1;   // BDS-3 GEO
-    return 0;                               // MEO 排除
+    int e = (int)floor(timediff(t,g_pbp_neq.t0)/g_pbp_neq.ti + 0.5);
+    if (e<0 || e>=g_pbp_neq.n_epoch) return -1;
+    return e;
 }
 
-extern void pbp_clear_fixed_constraints(void) { pbp_pb_weight=1e10; pbp_free_arcfix(); }
-extern int  pbp_has_fixed_constraints(void) { return pbp_n_arcfix > 0; }
+static int pbp_ztd_id(gtime_t t)
+{
+    int h = (int)floor(timediff(t,g_pbp_neq.t0)/3600.0);
+    if (h<0) h=0;
+    if (h>=g_pbp_neq.n_ztd) h=g_pbp_neq.n_ztd-1;
+    return h;
+}
+
+static int pbp_find_arc_by_time(int sat, gtime_t t)
+{
+    for (int i=0;i<g_pbp_neq.n_arc_used;i++) {
+        if (g_pbp_neq.arc_cols[i].sat != sat) continue;
+        if (timediff(t,g_pbp_neq.arc_cols[i].ts) < -DTTOL) continue;
+        if (timediff(t,g_pbp_neq.arc_cols[i].te) >  DTTOL) continue;
+        return g_pbp_neq.arc_cols[i].amb_col;
+    }
+    return -1;
+}
+
+extern int pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n, const double *v, const double *H, const double *R, int nv)
+{
+    const prcopt_t *opt;
+    double *Ri=NULL;
+    int *gmap=NULL;
+    int e,ntrop;
+    if (!rtk || !obs || n<=0 || !v || !H || !R || nv<=0 || !pbp_neq_accum_flag) return 0;
+    if (!g_pbp_neq.N) return 0;
+    opt=&rtk->opt;
+    e = pbp_epoch_id(obs[0].time);
+    if (e<0) return 0;
+    ntrop = pbp_neq_ntrop(opt);
+    Ri = mat(nv,nv);
+    gmap = (int*)malloc(sizeof(int)*rtk->nx);
+    if (!Ri || !gmap) { free(Ri); free(gmap); return 0; }
+    matcpy(Ri,R,nv,nv);
+    if (matinv(Ri,nv)) { free(Ri); free(gmap); return 0; }
+    for (int i=0;i<rtk->nx;i++) gmap[i]=-1;
+    gmap[0]=0; gmap[1]=1; gmap[2]=2;
+    for (int s=0;s<pbp_NC(opt);s++) gmap[pbp_NP(opt)+s] = g_pbp_neq.clock_col[e*g_pbp_neq.n_clk_sys+s];
+    if (pbp_NT(opt)>0) gmap[pbp_NP(opt)+pbp_NC(opt)] = g_pbp_neq.ztd_col[pbp_ztd_id(obs[0].time)*PBP_MAX2(1,ntrop)];
+    for (int i=0;i<n && i<MAXOBS;i++) {
+        int col = pbp_find_arc_by_time(obs[i].sat, obs[i].time);
+        if (col<0) continue;
+        gmap[pbp_IB(obs[i].sat,0,opt)] = col;
+    }
+    for (int a=0;a<rtk->nx;a++) {
+        int ga=gmap[a];
+        if (ga<0) continue;
+        double wa=0.0;
+        for (int k=0;k<nv;k++) {
+            double rikv=0.0;
+            for (int l=0;l<nv;l++) rikv += Ri[k+l*nv]*v[l];
+            wa += H[a+k*rtk->nx]*rikv;
+        }
+        g_pbp_neq.w[ga] += wa;
+        for (int b=0;b<rtk->nx;b++) {
+            int gb=gmap[b];
+            if (gb<0) continue;
+            double Nab=0.0;
+            for (int k=0;k<nv;k++) {
+                double rikHb=0.0;
+                for (int l=0;l<nv;l++) rikHb += Ri[k+l*nv]*H[b+l*rtk->nx];
+                Nab += H[a+k*rtk->nx]*rikHb;
+            }
+            g_pbp_neq.N[ga + gb*g_pbp_neq.n_total] += Nab;
+        }
+    }
+    free(Ri); free(gmap);
+    return 1;
+}
+
+static int pbp_add_one_dd_constraint(int sat1, int sat2, double bc, double wt)
+{
+    int r0=-1,r1=-1,s0=-1,s1=-1;
+    int c[4];
+    double d[4]={+1.0,-1.0,-1.0,+1.0};
+    if (!select_best_arc_pair(satamb,sat1,&r0,&r1)) return 0;
+    if (!select_best_arc_pair(satamb,sat2,&s0,&s1)) return 0;
+    c[0]=pbp_find_arc_col(sat1,0,r0); c[1]=pbp_find_arc_col(sat1,1,r1);
+    c[2]=pbp_find_arc_col(sat2,0,s0); c[3]=pbp_find_arc_col(sat2,1,s1);
+    if (c[0]<0||c[1]<0||c[2]<0||c[3]<0) return 0;
+    for (int a=0;a<4;a++) {
+        g_pbp_neq.w[c[a]] += wt*d[a]*bc;
+        for (int b=0;b<4;b++) g_pbp_neq.N[c[a] + c[b]*g_pbp_neq.n_total] += wt*d[a]*d[b];
+    }
+    return 1;
+}
+
+extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
+{
+    pbp_pb_weight = Pb>0.0 ? Pb : 1.0e10;
+    if (!dd || n_dd<=0) return 0;
+    if (!pbp_build_arc_columns()) return 0;
+    g_pbp_neq.n_ddc = 0;
+    for (int i=0;i<n_dd && g_pbp_neq.n_ddc<PBP_MAX_DD_CONSTR;i++) {
+        if (!dd[i].fixed_WL || !dd[i].fixed_NL) continue;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat1 = dd[i].sat1;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat2 = dd[i].sat2;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].bc   = dd[i].DD_IF_fix;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].weight = pbp_pb_weight;
+        g_pbp_neq.n_ddc++;
+    }
+    fprintf(stderr,"[PBP-NEQ] selected DD constraints=%d\n",g_pbp_neq.n_ddc);
+    return g_pbp_neq.n_ddc;
+}
+
+extern int pbp_finalize_final_neq(void)
+{
+    double *Q=NULL;
+    if (!g_pbp_neq.N || !g_pbp_neq.w) return 0;
+    for (int i=0;i<g_pbp_neq.n_ddc;i++) pbp_add_one_dd_constraint(g_pbp_neq.ddc[i].sat1,g_pbp_neq.ddc[i].sat2,g_pbp_neq.ddc[i].bc,g_pbp_neq.ddc[i].weight);
+    Q = mat(g_pbp_neq.n_total,g_pbp_neq.n_total);
+    if (!Q) return 0;
+    matcpy(Q,g_pbp_neq.N,g_pbp_neq.n_total,g_pbp_neq.n_total);
+    if (matinv(Q,g_pbp_neq.n_total)) { free(Q); return 0; }
+    matmul("NN",g_pbp_neq.n_total,1,g_pbp_neq.n_total,Q,g_pbp_neq.w,g_pbp_neq.xhat);
+    for (int e=0;e<g_pbp_neq.n_epoch;e++) {
+        for (int s=0;s<g_pbp_neq.n_clk_sys;s++) {
+            int col = g_pbp_neq.clock_col[e*g_pbp_neq.n_clk_sys+s];
+            g_pbp_neq.fixed_clk[e*g_pbp_neq.n_clk_sys+s] = g_pbp_neq.xhat[col];
+        }
+    }
+    g_pbp_neq.ready = 1;
+    fprintf(stderr,"[PBP-NEQ] solve OK: arcs=%d dd=%d total=%d\n",g_pbp_neq.n_arc_used,g_pbp_neq.n_ddc,g_pbp_neq.n_total);
+    free(Q);
+    return 1;
+}
+
+extern int pbp_get_fixed_clock(gtime_t t, int sys_idx, double *clk)
+{
+    int e;
+    if (!g_pbp_neq.ready || !clk) return 0;
+    e = pbp_epoch_id(t);
+    if (e<0) return 0;
+    if (sys_idx<0 || sys_idx>=g_pbp_neq.n_clk_sys) return 0;
+    *clk = g_pbp_neq.fixed_clk[e*g_pbp_neq.n_clk_sys+sys_idx];
+    return 1;
+}
 
 extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var)
 {
-    if (!pbp_resolve_flag || pbp_n_arcfix<=0 || !bias) return 0;
-    for (int i = 0; i < pbp_n_arcfix; i++) {
-        if (!pbp_arcfix[i].used || pbp_arcfix[i].sat!=sat) continue;
-        if (timediff(t, pbp_arcfix[i].ts) < -DTTOL) continue;
-        if (timediff(t, pbp_arcfix[i].te) >  DTTOL) continue;
-        *bias = pbp_arcfix[i].b_fix;
-        if (var) *var = pbp_arcfix[i].var_fix;
-        return 1;
-    }
-    return 0;
+    (void)t; (void)sat; (void)bias; (void)var;
+    return 0; /* arc-level IF prior path removed */
 }
-
-/* ── pbp_store_fixed_constraints ─────────────────────────────────────────────
- *
- * Build the NEQ from ALL fixed DD pairs, solve it, then store DAY-0 arc
- * entries only as tight integer priors for Pass-2.
- *
- * ── EARLY-SESSION STEP IN CLOCK DIFFERENCE — root cause and fix ─────────
- *
- * The step visible in the inter-station clock difference at the beginning
- * of the time-transfer series is caused by the `continue` statement in
- * ppp.c/udbias_ppp that was previously executed for EVERY epoch where
- * has_fix_arc == 1.  This blocked ALL Kalman measurement updates for
- * fixed-arc satellites, forcing the receiver clock to absorb 100 % of
- * the range residuals (position + clock + trop error) during the EKF
- * convergence period.  The two stations experienced different convergence
- * trajectories, and their clock difference showed a step.
- *
- * FIX (implemented in ppp.c):
- *   The `continue` is now placed INSIDE the initialisation branch
- *   (x[j]==0 || slip), so it only executes for the single epoch at
- *   which the arc is first initialised.  For all subsequent epochs the
- *   normal Kalman measurement update runs, distributing residuals across
- *   position, clock, trop AND ambiguity — identical to the float solution.
- *   The tight integer prior (var_fix = 1e-4 m²) maintained by the EKF
- *   naturally keeps the ambiguity within ~1 mm of b_fix throughout the
- *   session without any additional intervention.
- *
- * FIX (implemented here in pbp_store_fixed_constraints):
- *   After the NEQ solve, only day-0 arc entries are retained in the
- *   arcfix list.  Day-1 entries are used for the cross-day DD constraint
- *   formulation but are discarded before Pass-2 begins.  This avoids
- *   any possibility of a spurious second initialisation at the day
- *   boundary.  var_fix is set to 1e-4 m² = (1 cm)² for all day-0
- *   entries regardless of the NEQ posterior variance.
- * ─────────────────────────────────────────────────────────────────────────── */
-extern int pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd, double Pb)
-{
-    double *N=NULL, *w=NULL, *x=NULL, *Q=NULL;
-    pbp_clear_fixed_constraints();
-    if (!dd || n_dd<=0) return 0;
-    if (Pb > 0.0) pbp_pb_weight = Pb;
-    if (pbp_build_arcfix_list() <= 0) return 0;
-
-    N = zeros(pbp_n_arcfix, pbp_n_arcfix);
-    w = zeros(pbp_n_arcfix, 1);
-    x = zeros(pbp_n_arcfix, 1);
-    if (!N || !w || !x) { free(N); free(w); free(x); pbp_clear_fixed_constraints(); return 0; }
-
-    /* Prior: diagonal from float arc variances */
-    for (int i = 0; i < pbp_n_arcfix; i++) {
-        double var = pbp_arcfix[i].var_float;
-        if (var < 1e-8) var = 1e-8;
-        N[i + i*pbp_n_arcfix] += 1.0/var;
-        w[i] += pbp_arcfix[i].b_float / var;
-    }
-
-    /* Constraints from ALL fixed DD pairs */
-    for (int i = 0; i < n_dd; i++) {
-        int r0, r1, s0, s1, ir0, ir1, is0, is1;
-        double bc, d[4] = {+1.0, -1.0, -1.0, +1.0};
-        int idx[4];
-        if (!dd[i].fixed_WL || !dd[i].fixed_NL) continue;
-        if (!select_best_arc_pair(satamb, dd[i].sat1, &r0, &r1)) continue;
-        if (!select_best_arc_pair(satamb, dd[i].sat2, &s0, &s1)) continue;
-        ir0=pbp_find_arcfix(dd[i].sat1,r0); ir1=pbp_find_arcfix(dd[i].sat1,r1);
-        is0=pbp_find_arcfix(dd[i].sat2,s0); is1=pbp_find_arcfix(dd[i].sat2,s1);
-        if (ir0<0||ir1<0||is0<0||is1<0) continue;
-        bc = dd[i].DD_IF_fix;
-        idx[0]=ir0; idx[1]=ir1; idx[2]=is0; idx[3]=is1;
-        for (int a=0; a<4; a++) {
-            w[idx[a]] += pbp_pb_weight * d[a] * bc;
-            for (int b2=0; b2<4; b2++)
-                N[idx[a]+idx[b2]*pbp_n_arcfix] += pbp_pb_weight * d[a] * d[b2];
-        }
-    }
-
-    Q = mat(pbp_n_arcfix, pbp_n_arcfix);
-    matcpy(Q, N, pbp_n_arcfix, pbp_n_arcfix);
-    if (matinv(Q, pbp_n_arcfix)) {
-        free(N); free(w); free(x); free(Q); pbp_clear_fixed_constraints(); return 0;
-    }
-    matmul("NN", pbp_n_arcfix, 1, pbp_n_arcfix, Q, w, x);
-    for (int i = 0; i < pbp_n_arcfix; i++) {
-        pbp_arcfix[i].b_fix   = x[i];
-        pbp_arcfix[i].var_fix = Q[i + i*pbp_n_arcfix];
-        /* Floor: use (1cm)² as minimum regardless of NEQ result */
-        if (pbp_arcfix[i].var_fix < 1e-4) pbp_arcfix[i].var_fix = 1e-4;
-        if (pbp_arcfix[i].var_fix > pbp_arcfix[i].var_float)
-            pbp_arcfix[i].var_fix = pbp_arcfix[i].var_float;
-    }
-    free(N); free(w); free(x); free(Q);
-
-    /* Keep only day-0 entries — day-1 entries were needed for the NEQ
-     * cross-day constraint formulation but must not produce a second
-     * initx() call at the day boundary in Pass-2.
-     * var_fix is clamped to exactly 1e-4 m² = (1 cm)² so that the
-     * integer prior is tight enough to constrain the ambiguity but
-     * loose enough to let the EKF measurement updates run naturally. */
-    {
-        int new_n = 0;
-        for (int i = 0; i < pbp_n_arcfix; i++) {
-            if (pbp_arcfix[i].day != 0) continue;   /* discard day-1 */
-            pbp_arcfix[i].var_fix     = 1e-4;        /* (1 cm)^2 integer prior */
-            pbp_arcfix[new_n++] = pbp_arcfix[i];
-        }
-        pbp_n_arcfix = new_n;
-    }
-
-    printf("[PBP] pbp_store_fixed_constraints: %d day-0 arc priors ready for Pass-2\n",
-           pbp_n_arcfix);
-    return pbp_n_arcfix;
-}
-
 
 /* ── Legacy link stubs ───────────────────────────────────────────────────── */
 extern int pbp_apply_session_pseudoobs(rtk_t *rtk) { (void)rtk; return 0; }
@@ -829,3 +937,15 @@ extern int apply_ar_fixed(rtk_t *rtk, const ddamb_t *ddamb, int n_dd)
 {
     (void)rtk; (void)ddamb; (void)n_dd; return 0;
 }
+extern int pbp_bds_is_sidereal(int sat)
+{
+    int prn = 0;
+    if (satsys(sat, &prn) != SYS_CMP) return 0;
+    if (prn >= 1  && prn <= 10) return 1;
+    if (prn == 13 || prn == 16) return 1;
+    if (prn >= 38 && prn <= 40) return 1;
+    if (prn >= 59 && prn <= 62) return 1;
+    return 0;
+}
+
+
