@@ -184,38 +184,25 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 
     /* receiver clocks */
     i = IC(0, &rtk->opt);
-    if (pbp_resolve_flag) {
-        double ctmp=0.0;
-        if (pbp_get_fixed_clock(rtk->sol.time,0,&ctmp)) x[i]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,1,&ctmp)) x[i+1]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,2,&ctmp)) x[i+2]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,3,&ctmp)) x[i+3]=ctmp;
-#ifdef ENAIRN
-        if (pbp_get_fixed_clock(rtk->sol.time,4,&ctmp)) x[i+4]=ctmp;
-#endif
-#ifdef BDS2BDS3
-        if (pbp_get_fixed_clock(rtk->sol.time,NSYS,&ctmp)) x[i+NSYS]=ctmp;
-#endif
-    }
 #ifdef ENAIRN
 #ifdef BDS2BDS3
     /* output all 6 systems: GPS, GLO, GAL, BDS2, IRN, BDS3 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
-                x[i] * 1E9 / CLIGHT,              // GPS 绝对钟差
-                x[i + 1] * 1E9 / CLIGHT, // GLO 绝对钟差
-                x[i + 2] * 1E9 / CLIGHT, // GAL 绝对钟差 
-                x[i + 3] * 1E9 / CLIGHT, // BDS2 绝对钟差 
-                x[i + 4] * 1E9 / CLIGHT, // IRN 绝对钟差 
-                x[i + 5] * 1E9 / CLIGHT, // BDS3 绝对钟差 
+                x[i] * 1E9 / CLIGHT,
+                x[i + 1] * 1E9 / CLIGHT,
+                x[i + 2] * 1E9 / CLIGHT,
+                x[i + 3] * 1E9 / CLIGHT,
+                x[i + 4] * 1E9 / CLIGHT,
+                x[i + 5] * 1E9 / CLIGHT,
                 STD(rtk, i) * 1E9 / CLIGHT,
-                STD(rtk, i + 1) * 1E9 / CLIGHT, 
-                STD(rtk, i + 2) * 1E9 / CLIGHT, 
+                STD(rtk, i + 1) * 1E9 / CLIGHT,
+                STD(rtk, i + 2) * 1E9 / CLIGHT,
                 STD(rtk, i + 3) * 1E9 / CLIGHT,
-                STD(rtk, i + 4) * 1E9 / CLIGHT, 
+                STD(rtk, i + 4) * 1E9 / CLIGHT,
                 STD(rtk, i + 5) * 1E9 / CLIGHT);
 #else
-    /* output 5 systems: GPS, GLO, GAL, BDS2, IRN (no BDS3) */
+    /* output 5 systems: GPS, GLO, GAL, BDS2, IRN */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
@@ -231,21 +218,21 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 #endif
 #else
 #ifdef BDS2BDS3
-    /* output 5 systems: GPS, GLO, GAL, BDS2, BDS3 (no IRN) */
+    /* output 5 systems: GPS, GLO, GAL, BDS2, BDS3 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
                 x[i + 1] * 1E9 / CLIGHT,
                 x[i + 2] * 1E9 / CLIGHT,
                 x[i + 3] * 1E9 / CLIGHT,
-                x[i + 5] * 1E9 / CLIGHT,  // BDS3 is at i+5 even without IRN
+                x[i + 5] * 1E9 / CLIGHT,
                 STD(rtk, i) * 1E9 / CLIGHT,
                 STD(rtk, i + 1) * 1E9 / CLIGHT,
                 STD(rtk, i + 2) * 1E9 / CLIGHT,
                 STD(rtk, i + 3) * 1E9 / CLIGHT,
                 STD(rtk, i + 5) * 1E9 / CLIGHT);
 #else
-    /* output 4 systems: GPS, GLO, GAL, BDS2 (no IRN, no BDS3) */
+    /* output 4 systems: GPS, GLO, GAL, BDS2 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
@@ -1607,31 +1594,18 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 
 	if (stat==SOLQ_PPP) {
 
-		if (ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel)) {
+		int nv_final = 0;
+		if ((nv_final=ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel))) {
 
             if (pbp_neq_accum_flag) {
-                (void)pbp_neq_add_epoch(rtk, obs, n, v, H, R, nv);
+                (void)pbp_neq_add_epoch(rtk, obs, n, v, H, R, nv_final);
             }
 
 			matcpy(rtk->xa,xp,rtk->nx,1);
 			matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
 
 			/* ambiguity resolution in ppp */
-			if (pbp_resolve_flag && pbp_has_fixed_constraints()) {
-				/*
-				 * Paper-style pass-2:
-				 * the fixed DD constraints have already been absorbed into the solved
-				 * arc-level IF ambiguities used in udstate/udbias. There is no extra
-				 * epoch-wise AR step here. We still need xa/Pa and update_stat() to run
-				 * through the standard output path, so copy the converged EKF state to
-				 * xa/Pa and then label the solution as FIX for output purposes.
-				 */
-				matcpy(rtk->xa,xp,rtk->nx,1);
-				matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
-				stat = SOLQ_FIX;
-				rtk->sol.ratio = 0.;
-			}
-			else if (opt->modear!=ARMODE_OFF)
+			if (opt->modear!=ARMODE_OFF)
 			{
                 if (isapplypppar) {
                     if(pppamb(rtk,obs,n,nav,azel,exc)){
