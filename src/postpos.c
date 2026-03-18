@@ -1611,7 +1611,13 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
             if (fptm) {
                 rtkinit(rtk_ptr,&popt_);
                 procpos(fp,fptm,&popt_,sopt,rtk_ptr,SOLMODE_SINGLE_DIR);
-
+                 /* Pass-by-Pass AR: process 48h ambiguity resolution if enabled */
+                if (popt_.armode_pbp > 0) {
+                    int n_fixed = ppp_ar_48h(&popt_, rtk_ptr, &obss);
+                    if (n_fixed > 0) {
+                        trace(1, "Pass-by-Pass AR: %d ambiguities fixed\n", n_fixed);
+                    }
+                }
                 rtkfree(rtk_ptr);
                 fclose(fptm);
             }
@@ -1649,6 +1655,13 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
                 rtkinit(rtk_ptr,&popt_);
             }
             procpos(NULL,NULL,&popt_,sopt,rtk_ptr,SOLMODE_COMBINED); /* backward */
+             /* Pass-by-Pass AR: process 48h ambiguity resolution if enabled */
+            if (popt_.armode_pbp > 0) {
+                int n_fixed = ppp_ar_48h(&popt_, rtk_ptr, &obss);
+                if (n_fixed > 0) {
+                    trace(1, "Pass-by-Pass AR: %d ambiguities fixed\n", n_fixed);
+                }
+            }
             rtkfree(rtk_ptr);
 
             /* combine forward/backward solutions */
@@ -2031,58 +2044,46 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                     /* these are provided by your PBP modules */
                     extern void init_arc_data(void);
                     extern int  ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs);
-                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag, pbp_neq_accum_flag, pbp_current_day;
+                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag, pbp_neq_accum_flag;
                     extern int  pbp_neq_init(gtime_t t0, gtime_t t1, double ti, const prcopt_t *opt);
                     extern int  pbp_finalize_final_neq(void);
-                    extern void pbp_set_day_window(int day, gtime_t ts, gtime_t te, double ti);
-                    extern int  pbp_write_day1_fixed_clock_file(const char *path);
                     extern int  n_ddamb;
                     extern int  refsat;
 
                     int day_ok0 = 0, day_ok1 = 0;
                     prcopt_t popt_run = *popt;
 
+                    popt_run.armode_pbp = 0; /* prevent nested ppp_ar_48h() call inside execses */
 
                     /* IMPORTANT: avoid ppp_ar_48h calling apply_ar_fixed on NULL rtk */
                     prcopt_t popt_ar  = *popt;
-                    //if (popt_ar.armode_pbp >= 3) popt_ar.armode_pbp = 2;
+                    if (popt_ar.armode_pbp >= 3) popt_ar.armode_pbp = 2;
 
                     init_arc_data();
                     n_ddamb = 0;
                     refsat  = 0;
 
-                    /* precompute actual day windows and initialize global NEQ once */
-                    gtime_t pbp_day_start[2], pbp_day_end[2];
-                    for (i=0;i<2;i++) {
-                        int current_week;
-                        double current_sow;
-                        current_sow  = (doy_start + i) * 86400.0;
-                        current_week = week_start;
-                        while (current_sow >= 604800.0) { current_sow -= 604800.0; current_week++; }
-                        pbp_day_start[i] = gpst2time(current_week, current_sow);
-                        pbp_day_end[i]   = timeadd(pbp_day_start[i], 86400.0 - DTTOL);
-                        if (timediff(pbp_day_start[i], ts_auto) < 0.0) pbp_day_start[i] = ts_auto;
-                        if (timediff(pbp_day_end[i],   te_auto) > 0.0) pbp_day_end[i]   = te_auto;
-                    }                
-                    {
-                        int neq_ok = pbp_neq_init(pbp_day_start[0], pbp_day_end[1], ti, &popt_run);
-                        if (!neq_ok) {
-                            printf("[PBP] ERROR: pbp_neq_init failed (memory allocation?). "
-                                   "Check n_clk_sys. Falling back to per-day processing.\n");
-                            fprintf(stderr,"[PBP-NEQ] pbp_neq_init returned 0 – aborting PBP path\n");
-                        }
-
                     /* ---------- PASS1: day0/day1 float + collect ---------- */
-                    if (neq_ok) {
                     pbp_collect_flag = 1;
                     pbp_apply_flag   = 0;
 
                     for (i=0;i<2;i++) {
 
                         gtime_t day_start, day_end;
+                        int current_week;
+                        double current_sow;
 
-                        day_start = pbp_day_start[i];
-                        day_end   = pbp_day_end[i];
+                        current_sow  = (doy_start + i) * 86400.0;
+                        current_week = week_start;
+                        while (current_sow >= 604800.0) {
+                            current_sow -= 604800.0;
+                            current_week++;
+                        }
+                        day_start = gpst2time(current_week, current_sow);
+                        day_end   = timeadd(day_start, 86400.0 - DTTOL);
+
+                        if (timediff(day_start, ts_auto) < 0.0) day_start = ts_auto;
+                        if (timediff(day_end,   te_auto) > 0.0) day_end   = te_auto;
 
                         printf("\n[PBP] Pass1 (float+collect) day %d: %s to %s\n", i+1,
                                time_str(day_start,0), time_str(day_end,0));
@@ -2120,16 +2121,12 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                         }
 
                         pbp_day_tag = i; /* force day tag for ambiguity collector */
-                        pbp_current_day = i;
-                        pbp_set_day_window(i, day_start, day_end, ti);
-                        pbp_neq_accum_flag = 1;
 
                         /* ensure B2b SSR restarts from the correct daily file */
                         reset_B2b_reader(i);
 
                         stat = execses_b(day_start, day_end, ti, &popt_run, sopt, fopt, 1,
                                          (const char **)ifile, index, nf, ofile, rov, base);
-                        pbp_neq_accum_flag = 0;
 
                         if (i==0 && stat==0) day_ok0 = 1;
                         if (i==1 && stat==0) day_ok1 = 1;
@@ -2145,32 +2142,51 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
 
                         if (ppp_ar_48h(&popt_ar, NULL, NULL) > 0 && popt->armode_pbp >= 3) {
 
-                            char statfile[1024] = {0};
-                            if (outfile && *outfile) {
-                                char tmp[1024];
-                                reppath(outfile, tmp, pbp_day_start[1], "", "");
-                                /* [FIX] Use .pbp_fixclk instead of .stat to avoid overwriting
-                                 * the EKF residual statistics file written by execses() */
-                                snprintf(statfile, sizeof(statfile), "%s.pbp_fixclk", tmp);
+                            gtime_t sess_start = day_aligned_start;
+                            gtime_t sess_end   = timeadd(day_aligned_start, 2.0 * 86400.0 - DTTOL);
+                            if (timediff(sess_end, te_auto) > 0.0) sess_end = te_auto;
+
+                            printf("\n[PBP] Pass2 (48h float accumulation for final NEQ): %s to %s\n",
+                                   time_str(sess_start,0), time_str(sess_end,0));
+
+                            for (j=k=nf=0;j<n;j++) {
+                                ttte = sess_end;
+                                if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) ttte = timeadd(ttte, 86400.0);
+                                else if (strstr(infile[j],"brdc")) ttte = timeadd(ttte, 7200.0);
+                                nf += reppaths(infile[j], ifile+nf, MAXINFILE-nf, sess_start, ttte, "", "");
+                                while (k<nf) index[k++]=j;
+                                if (nf>=MAXINFILE) { trace(2,"too many input files. truncated\n"); break; }
                             }
 
+                            reppath(outfile, ofile, sess_start, "", "");
+                            remove(ofile);
+                            rtkclosestat();
+
+                            pbp_day_tag      = -1;
+                            pbp_collect_flag = 0;
+                            pbp_apply_flag   = 0;
+                            pbp_resolve_flag = 0;
+                            pbp_neq_accum_flag = 0;
+                            (void)pbp_neq_init(sess_start, sess_end, ti, &popt_run);
+                            pbp_neq_accum_flag = 1;
+
+                            reset_B2b_reader(0);
+                            stat = execses_b(sess_start, sess_end, ti, &popt_run, sopt, fopt, 1,
+                                             (const char **)ifile, index, nf, ofile, rov, base);
+                            pbp_neq_accum_flag = 0;
+
                             if (stat==0 && pbp_finalize_final_neq()) {
-                                if (*statfile) {
-                                    if (!pbp_write_day1_fixed_clock_file(statfile)) {
-                                        printf("[PBP] ERROR: failed to write fixed clock file: %s\n", statfile);
-                                        stat = -1;
-                                    }
-                                }
-                                else {
-                                    printf("[PBP] ERROR: invalid output file path for fixed clock file.\n");
-                                    stat = -1;
-                                }
+                                printf("\n[PBP] Pass3 (write fixed clock series from solved NEQ)\n");
+                                remove(ofile);
+                                rtkclosestat();
+                                pbp_resolve_flag = 1;
+                                reset_B2b_reader(0);
+                                stat = execses_b(sess_start, sess_end, ti, &popt_run, sopt, fopt, 1,
+                                                 (const char **)ifile, index, nf, ofile, rov, base);
+                                pbp_resolve_flag = 0;
                             }
 
                             pbp_day_tag = -1;
-                            pbp_current_day = -1;
-                            pbp_resolve_flag = 0;
-                            pbp_neq_accum_flag = 0;
                             if (stat==0) processed_days = 2;
                         }
                         else {
@@ -2180,11 +2196,12 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                     }
                     else {
                         /* fallback: original per-day processing */
-                        printf("[PBP] Warning: pass1 failed, fallback to per-day processing.\n");                    }
-                    } /* end neq_ok guard */
-                    } /* end pbp_neq_init scope */
+                        printf("[PBP] Warning: pass1 failed, fallback to per-day processing.\n");
+                        for (i=0;i<num_days;i++) {
+                            /* (reuse the original per-day loop below if you want) */
+                        }
+                    }
                 }
-                /* (pbp_neq_init_failed label removed; use flag approach above) */
 
                 /* ============================================================= */
                 /* Original per-day processing (when not PBP) */
