@@ -70,6 +70,10 @@ extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var)
 extern int pbp_neq_accum_flag;
 extern int pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n, const double *v, const double *H, const double *R, int nv);
 extern int pbp_get_fixed_clock(gtime_t t, int sys_idx, double *clk);
+extern int pbp_collect_flag;
+extern int pbp_day_tag;
+extern int pbp_epoch_collected;   /* set=1 by pppos after collect, checked by postpos */
+extern int collect_ambiguities_epoch(const rtk_t *rtk, const obsd_t *obs, int n, int day);
 #define SQR(x)      ((x)*(x))
 #define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
 #define MAX(x,y)    ((x)>(y)?(x):(y))
@@ -1521,9 +1525,14 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	char str[32];
 	int i,j,nv,info,svh[MAXOBS],brdc[MAXOBS],exc[MAXOBS]={0},stat=SOLQ_SINGLE;
 	double dpos[3] = {0x00};
+	/* OMC buffers for NEQ accumulation (paper Eq.3-5) */
+	double *v_omc=NULL, *H_omc=NULL, *R_omc=NULL;
+	int nv_omc=0;
 
 	time2str(obs[0].time,str,2);
 	trace(2,"pppos   : time=%s nx=%d n=%d\n",str,rtk->nx,n);
+
+	pbp_epoch_collected = 0; /* reset per-epoch flag */
 
 	rs=mat(6,n); dts=mat(2,n); var=mat(1,n); azel=zeros(2,n);
 
@@ -1553,9 +1562,7 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	xp=mat(rtk->nx,1); Pp=zeros(rtk->nx,rtk->nx);
 	v=mat(nv,1); H=mat(rtk->nx,nv); R=mat(nv,nv);
 
-	/* ── OMC buffer for NEQ accumulation (paper Eq.3-5: use prefit residuals) ── */
-	double *v_omc=NULL, *H_omc=NULL, *R_omc=NULL;
-	int nv_omc=0;
+	/* allocate OMC buffers if NEQ accumulation is active */
 	if (pbp_neq_accum_flag) {
 		v_omc=mat(nv,1); H_omc=mat(rtk->nx,nv); R_omc=mat(nv,nv);
 	}
@@ -1608,6 +1615,19 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
              * Paper Eq.4-5: N += H^T P H,  w += H^T P l  (P = R^{-1})
              * ppp_res(0,...) computes l_e (OMC); ppp_res(9,...) computes postfit residual */
             if (pbp_neq_accum_flag && nv_omc > 0 && v_omc && H_omc && R_omc) {
+                /* CRITICAL: collect arc data into satamb[] BEFORE NEQ accumulation.
+                 * pbp_neq_add_epoch uses pbp_get_arc_col_from_satamb() which looks
+                 * up arcs in satamb[]. At the first epoch of a new arc, the arc
+                 * doesn't exist yet if collection hasn't run. So we must collect
+                 * here, and set a flag to prevent the postpos.c call from
+                 * double-counting this epoch. */
+                if (pbp_collect_flag) {
+                    int cur_day = pbp_day_tag;
+                    if (cur_day == 0 || cur_day == 1) {
+                        (void)collect_ambiguities_epoch(rtk, obs, n, cur_day);
+                        pbp_epoch_collected = 1;
+                    }
+                }
                 (void)pbp_neq_add_epoch(rtk, obs, n, v_omc, H_omc, R_omc, nv_omc);
             }
 
