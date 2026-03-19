@@ -184,38 +184,25 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 
     /* receiver clocks */
     i = IC(0, &rtk->opt);
-    if (pbp_resolve_flag) {
-        double ctmp=0.0;
-        if (pbp_get_fixed_clock(rtk->sol.time,0,&ctmp)) x[i]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,1,&ctmp)) x[i+1]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,2,&ctmp)) x[i+2]=ctmp;
-        if (pbp_get_fixed_clock(rtk->sol.time,3,&ctmp)) x[i+3]=ctmp;
-#ifdef ENAIRN
-        if (pbp_get_fixed_clock(rtk->sol.time,4,&ctmp)) x[i+4]=ctmp;
-#endif
-#ifdef BDS2BDS3
-        if (pbp_get_fixed_clock(rtk->sol.time,NSYS,&ctmp)) x[i+NSYS]=ctmp;
-#endif
-    }
 #ifdef ENAIRN
 #ifdef BDS2BDS3
     /* output all 6 systems: GPS, GLO, GAL, BDS2, IRN, BDS3 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
-                x[i] * 1E9 / CLIGHT,              // GPS 绝对钟差
-                x[i + 1] * 1E9 / CLIGHT, // GLO 绝对钟差
-                x[i + 2] * 1E9 / CLIGHT, // GAL 绝对钟差 
-                x[i + 3] * 1E9 / CLIGHT, // BDS2 绝对钟差 
-                x[i + 4] * 1E9 / CLIGHT, // IRN 绝对钟差 
-                x[i + 5] * 1E9 / CLIGHT, // BDS3 绝对钟差 
+                x[i] * 1E9 / CLIGHT,
+                x[i + 1] * 1E9 / CLIGHT,
+                x[i + 2] * 1E9 / CLIGHT,
+                x[i + 3] * 1E9 / CLIGHT,
+                x[i + 4] * 1E9 / CLIGHT,
+                x[i + 5] * 1E9 / CLIGHT,
                 STD(rtk, i) * 1E9 / CLIGHT,
-                STD(rtk, i + 1) * 1E9 / CLIGHT, 
-                STD(rtk, i + 2) * 1E9 / CLIGHT, 
+                STD(rtk, i + 1) * 1E9 / CLIGHT,
+                STD(rtk, i + 2) * 1E9 / CLIGHT,
                 STD(rtk, i + 3) * 1E9 / CLIGHT,
-                STD(rtk, i + 4) * 1E9 / CLIGHT, 
+                STD(rtk, i + 4) * 1E9 / CLIGHT,
                 STD(rtk, i + 5) * 1E9 / CLIGHT);
 #else
-    /* output 5 systems: GPS, GLO, GAL, BDS2, IRN (no BDS3) */
+    /* output 5 systems: GPS, GLO, GAL, BDS2, IRN */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
@@ -231,21 +218,21 @@ extern int pppoutstat(rtk_t *rtk, char *buff)
 #endif
 #else
 #ifdef BDS2BDS3
-    /* output 5 systems: GPS, GLO, GAL, BDS2, BDS3 (no IRN) */
+    /* output 5 systems: GPS, GLO, GAL, BDS2, BDS3 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
                 x[i + 1] * 1E9 / CLIGHT,
                 x[i + 2] * 1E9 / CLIGHT,
                 x[i + 3] * 1E9 / CLIGHT,
-                x[i + 5] * 1E9 / CLIGHT,  // BDS3 is at i+5 even without IRN
+                x[i + 5] * 1E9 / CLIGHT,
                 STD(rtk, i) * 1E9 / CLIGHT,
                 STD(rtk, i + 1) * 1E9 / CLIGHT,
                 STD(rtk, i + 2) * 1E9 / CLIGHT,
                 STD(rtk, i + 3) * 1E9 / CLIGHT,
                 STD(rtk, i + 5) * 1E9 / CLIGHT);
 #else
-    /* output 4 systems: GPS, GLO, GAL, BDS2 (no IRN, no BDS3) */
+    /* output 4 systems: GPS, GLO, GAL, BDS2 */
     p += sprintf(p, "$CLK,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 sol_time_str, rtk->sol.stat, 1,
                 x[i] * 1E9 / CLIGHT,
@@ -1566,15 +1553,30 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	xp=mat(rtk->nx,1); Pp=zeros(rtk->nx,rtk->nx);
 	v=mat(nv,1); H=mat(rtk->nx,nv); R=mat(nv,nv);
 
+	/* ── OMC buffer for NEQ accumulation (paper Eq.3-5: use prefit residuals) ── */
+	double *v_omc=NULL, *H_omc=NULL, *R_omc=NULL;
+	int nv_omc=0;
+	if (pbp_neq_accum_flag) {
+		v_omc=mat(nv,1); H_omc=mat(rtk->nx,nv); R_omc=mat(nv,nv);
+	}
+
 	for (i=0;i<MAX_ITER;i++) {
 
 		matcpy(xp,rtk->x,rtk->nx,1);
 		matcpy(Pp,rtk->P,rtk->nx,rtk->nx);
 
-		/* prefit residuals */
+		/* prefit residuals (OMCs: observed minus computed) */
 		if (!(nv=ppp_res(0,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel))) {
 			trace(2,"%s ppp (%d) no valid obs data\n",str,i+1);
 			break;
+		}
+
+		/* save OMC (prefit) v, H, R for NEQ accumulation (paper Eq.3: l_e = OMC) */
+		if (pbp_neq_accum_flag && v_omc && H_omc && R_omc) {
+			nv_omc = nv;
+			matcpy(v_omc, v, nv, 1);
+			matcpy(H_omc, H, rtk->nx * nv, 1);
+			matcpy(R_omc, R, nv * nv, 1);
 		}
 
 		/* measurement update of ekf states */
@@ -1587,15 +1589,6 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 		if (ppp_res(i+1,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel)) {
 			matcpy(rtk->x,xp,rtk->nx,1);
 			matcpy(rtk->P,Pp,rtk->nx,rtk->nx);
-			/*
-			 * IMPORTANT:
-			 * In Pass-2 paper-style re-resolve we must NOT set stat=SOLQ_FIX here.
-			 * Doing so skips the whole "if (stat==SOLQ_PPP)" branch below, which
-			 * contains ppp_res(9), update_stat(), and the normal solution-output path.
-			 * That was the direct reason for Pass-2 epochs ending up as Q=0 with no
-			 * .stat output.  Keep the EKF result as SOLQ_PPP here, then mark it FIX
-			 * only after xa/Pa are prepared and update_stat() is called.
-			 */
 			stat = SOLQ_PPP;
 			break;
 		}
@@ -1607,31 +1600,22 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 
 	if (stat==SOLQ_PPP) {
 
-		if (ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel)) {
+		int nv_final = 0;
+		if ((nv_final=ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel))) {
 
-            if (pbp_neq_accum_flag) {
-                (void)pbp_neq_add_epoch(rtk, obs, n, v, H, R, nv);
+            /* NEQ accumulation: use PREFIT OMCs (v_omc, H_omc, R_omc), NOT postfit v
+             * Paper Eq.3: v_e = A_e*x + B_e*b + C_e*u - l_e, where l_e = OMC
+             * Paper Eq.4-5: N += H^T P H,  w += H^T P l  (P = R^{-1})
+             * ppp_res(0,...) computes l_e (OMC); ppp_res(9,...) computes postfit residual */
+            if (pbp_neq_accum_flag && nv_omc > 0 && v_omc && H_omc && R_omc) {
+                (void)pbp_neq_add_epoch(rtk, obs, n, v_omc, H_omc, R_omc, nv_omc);
             }
 
 			matcpy(rtk->xa,xp,rtk->nx,1);
 			matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
 
 			/* ambiguity resolution in ppp */
-			if (pbp_resolve_flag && pbp_has_fixed_constraints()) {
-				/*
-				 * Paper-style pass-2:
-				 * the fixed DD constraints have already been absorbed into the solved
-				 * arc-level IF ambiguities used in udstate/udbias. There is no extra
-				 * epoch-wise AR step here. We still need xa/Pa and update_stat() to run
-				 * through the standard output path, so copy the converged EKF state to
-				 * xa/Pa and then label the solution as FIX for output purposes.
-				 */
-				matcpy(rtk->xa,xp,rtk->nx,1);
-				matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx);
-				stat = SOLQ_FIX;
-				rtk->sol.ratio = 0.;
-			}
-			else if (opt->modear!=ARMODE_OFF)
+			if (opt->modear!=ARMODE_OFF)
 			{
                 if (isapplypppar) {
                     if(pppamb(rtk,obs,n,nav,azel,exc)){
@@ -1669,6 +1653,7 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
     }
     free(rs); free(dts); free(var); free(azel);
     free(xp); free(Pp); free(v); free(H); free(R);
+    free(v_omc); free(H_omc); free(R_omc);
 }
 
 
