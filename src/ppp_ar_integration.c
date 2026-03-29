@@ -1,20 +1,25 @@
 /*------------------------------------------------------------------------------
 * ppp_ar_integration.c : Integration wrapper for Pass-by-Pass AR
 *
-* v3.0 changes (pbp_write_dd_wlnl):
-*   [ADDED] 5-bin fraction distribution for DD WL and DD NL
-*   [ADDED] GPS / BDS per-system split statistics
-*   [ADDED] Both "all independent DD" and "fixed only" sets
-*   [KEPT]  Original |frac|<0.2 counting intact
+* v4.0 changes:
+*   [ADDED] Visible satellite counts per GPS/BDS system
+*   [CHANGED] Refined [-0.2,0.2] bin into 6 sub-bins:
+*             [0,0.1] (0.1,0.15] (0.15,0.2] [-0.1,0) [-0.15,-0.1) [-0.2,-0.15)
+*   [KEPT] Original bins for mid-range and far: [-0.4,-0.2) (0.2,0.4] etc.
+*   [KEPT] GPS / BDS per-system split statistics
+*   [KEPT] Both "all independent DD" and "fixed only" sets
 *
-*   Bin definitions (pbp_frac output = signed distance to nearest integer):
-*     bin 0: [-0.2, 0.2]    near integer
-*     bin 1: [-0.4,-0.2)    left mid-range
-*     bin 2: ( 0.2, 0.4]    right mid-range
-*     bin 3: (-inf,-0.4)    far left
-*     bin 4: ( 0.4,+inf)    far right
-*
-*   BDS count = entries already in ddamb[] (MEO sats failing arc-pairing excluded)
+*   10-bin definitions (pbp_frac output = signed distance to nearest integer):
+*     bin 0: [ 0.0,  0.1]      near integer (positive, tight)
+*     bin 1: ( 0.1,  0.15]     near integer (positive, medium)
+*     bin 2: ( 0.15, 0.2]      near integer (positive, edge)
+*     bin 3: [-0.1,  0.0)      near integer (negative, tight)
+*     bin 4: [-0.15,-0.1)      near integer (negative, medium)
+*     bin 5: [-0.2, -0.15)     near integer (negative, edge)
+*     bin 6: [-0.4, -0.2)      left mid-range
+*     bin 7: ( 0.2,  0.4]      right mid-range
+*     bin 8: (-inf, -0.4)      far left
+*     bin 9: ( 0.4, +inf)      far right
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 #include "ppp_ar_passbypass.h"
@@ -34,34 +39,58 @@ static double pbp_frac(double x)
     return r;
 }
 
-/* classify frac into bin 0-4 */
+/* classify frac into 10 bins (refined near-integer sub-bins)
+ *   bin 0: [ 0.0,  0.1]      near integer (positive)
+ *   bin 1: ( 0.1,  0.15]     
+ *   bin 2: ( 0.15, 0.2]      
+ *   bin 3: [-0.1,  0.0)      near integer (negative)
+ *   bin 4: [-0.15,-0.1)      
+ *   bin 5: [-0.2, -0.15)     
+ *   bin 6: [-0.4, -0.2)      left mid-range
+ *   bin 7: ( 0.2,  0.4]      right mid-range
+ *   bin 8: (-inf, -0.4)      far left
+ *   bin 9: ( 0.4, +inf)      far right
+ */
+#define NFRACBIN 10
 static int frac_bin(double frac)
 {
-    if (frac >= -0.2 && frac <=  0.2) return 0;
-    if (frac >= -0.4 && frac <  -0.2) return 1;
-    if (frac >   0.2 && frac <=  0.4) return 2;
-    if (frac <  -0.4)                  return 3;
-    return 4;
+    if (frac >=  0.0  && frac <=  0.1 ) return 0;
+    if (frac >   0.1  && frac <=  0.15) return 1;
+    if (frac >   0.15 && frac <=  0.2 ) return 2;
+    if (frac >= -0.1  && frac <   0.0 ) return 3;
+    if (frac >= -0.15 && frac <  -0.1 ) return 4;
+    if (frac >= -0.2  && frac <  -0.15) return 5;
+    if (frac >= -0.4  && frac <  -0.2 ) return 6;
+    if (frac >   0.2  && frac <=  0.4 ) return 7;
+    if (frac <  -0.4)                    return 8;
+    return 9;
 }
 
-/* write one 5-bin percentage line */
+/* write one 10-bin percentage line */
 static void print_frac_bins(FILE *fp, const char *prefix,
-                             const int cnt[5], int total)
+                             const int cnt[NFRACBIN], int total)
 {
     if (!fp || total <= 0) return;
     double t = (double)total;
+    /* Group: near-integer = bins 0-5, mid-range = 6+7, far = 8+9 */
+    int near_int = cnt[0]+cnt[1]+cnt[2]+cnt[3]+cnt[4]+cnt[5];
     fprintf(fp,
-        "%s: [-0.2,0.2]=%5.1f%%  [-0.4,-0.2)=%5.1f%%  (0.2,0.4]=%5.1f%%"
-        "  <-0.4=%5.1f%%  >0.4=%5.1f%%  (n=%d)\n",
-        prefix,
-        100.0*cnt[0]/t, 100.0*cnt[1]/t, 100.0*cnt[2]/t,
-        100.0*cnt[3]/t, 100.0*cnt[4]/t, total);
+        "%s (n=%d):\n"
+        "%s   [0,0.1]=%.1f%%  (0.1,0.15]=%.1f%%  (0.15,0.2]=%.1f%%\n"
+        "%s   [-0.1,0)=%.1f%%  [-0.15,-0.1)=%.1f%%  [-0.2,-0.15)=%.1f%%\n"
+        "%s   [-0.4,-0.2)=%.1f%%  (0.2,0.4]=%.1f%%  <-0.4=%.1f%%  >0.4=%.1f%%\n"
+        "%s   near-int(|f|<=0.2)=%.1f%%\n",
+        prefix, total,
+        prefix, 100.0*cnt[0]/t, 100.0*cnt[1]/t, 100.0*cnt[2]/t,
+        prefix, 100.0*cnt[3]/t, 100.0*cnt[4]/t, 100.0*cnt[5]/t,
+        prefix, 100.0*cnt[6]/t, 100.0*cnt[7]/t, 100.0*cnt[8]/t, 100.0*cnt[9]/t,
+        prefix, 100.0*near_int/t);
 }
 
 /*------------------------------------------------------------------------------
 * pbp_write_dd_wlnl : write DD WL/NL table + extended statistics
 *
-*   [NEW §2] 5-bin fraction distribution for all/fixed, total + GPS + BDS
+*   [NEW §2] 10-bin fraction distribution for all/fixed, total + GPS + BDS
 *   [KEPT §1] Original |frac|<0.2 summary block unchanged
 *-----------------------------------------------------------------------------*/
 static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *tag)
@@ -72,10 +101,10 @@ static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *t
     int n_wl_all=0, n_wl_02=0, n_wl_fix=0, n_wl_fix_02=0;
     int n_nl_all=0, n_nl_02=0, n_nl_fix=0, n_nl_fix_02=0;
 
-    /* 5-bin counters: [sys_idx][subset][bin]
+    /* 10-bin counters: [sys_idx][subset][bin]
      *   sys_idx : 0=all  1=GPS  2=BDS
      *   subset  : 0=all independent DD  1=fixed only             */
-    int wl_bins[3][2][5], nl_bins[3][2][5];
+    int wl_bins[3][2][NFRACBIN], nl_bins[3][2][NFRACBIN];
     int wl_cnt[3][2],     nl_cnt[3][2];
     memset(wl_bins, 0, sizeof(wl_bins));
     memset(nl_bins, 0, sizeof(nl_bins));
@@ -153,7 +182,7 @@ static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *t
         fprintf(fp, "# NL: fixed=%d, in0.2=%d (%.2f%%)\n",
                 n_nl_fix, n_nl_fix_02, 100.0*(double)n_nl_fix_02/(double)n_nl_fix);
 
-    /* ── §2  5-bin: all systems ─────────────────────────────────────────── */
+    /* ── §2  10-bin: all systems ────────────────────────────────────────── */
     fprintf(fp, "# --- Fraction bins (all independent DD) ---\n");
     print_frac_bins(fp, "# WL bins", wl_bins[0][0], wl_cnt[0][0]);
     print_frac_bins(fp, "# NL bins", nl_bins[0][0], nl_cnt[0][0]);
@@ -298,6 +327,40 @@ extern int ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs)
         fprintf(fpdd,"# PBP arc-level DD WL/NL (day0-day1)\n");
         fprintf(fpdd,"# CWD: %s\n",cwd);
         fprintf(fpdd,"# BDS = sats passing arc-pairing (non-1-day repeat excluded)\n");
+
+        /* ── Visible satellite counts ──────────────────────────────────── */
+        {
+            int n_gps_d0=0,n_gps_d1=0,n_gps_both=0;
+            int n_bds_d0=0,n_bds_d1=0,n_bds_both=0;
+            for (int i=0;i<MAXSAT;i++){
+                if (satamb[i].n<=0) continue;
+                int sat=i+1, sys=satsys(sat,NULL);
+                int has0=0,has1=0;
+                for (int j=0;j<satamb[i].n;j++){
+                    if (satamb[i].arc[j].nobs>=10){
+                        if (satamb[i].arc[j].day==0) has0=1;
+                        if (satamb[i].arc[j].day==1) has1=1;
+                    }
+                }
+                if (sys==SYS_GPS){
+                    if(has0) n_gps_d0++;
+                    if(has1) n_gps_d1++;
+                    if(has0&&has1) n_gps_both++;
+                } else if (sys==SYS_CMP){
+                    if(has0) n_bds_d0++;
+                    if(has1) n_bds_d1++;
+                    if(has0&&has1) n_bds_both++;
+                }
+            }
+            fprintf(fpdd,"# --- Visible satellites (nobs>=10) ---\n");
+            fprintf(fpdd,"# GPS: day0=%d  day1=%d  both=%d\n",n_gps_d0,n_gps_d1,n_gps_both);
+            fprintf(fpdd,"# BDS: day0=%d  day1=%d  both=%d\n",n_bds_d0,n_bds_d1,n_bds_both);
+            fprintf(fpdd,"# Total: day0=%d  day1=%d  both=%d\n",
+                    n_gps_d0+n_bds_d0,n_gps_d1+n_bds_d1,n_gps_both+n_bds_both);
+            printf("Visible sats: GPS(d0=%d d1=%d both=%d) BDS(d0=%d d1=%d both=%d)\n",
+                   n_gps_d0,n_gps_d1,n_gps_both,n_bds_d0,n_bds_d1,n_bds_both);
+        }
+
         fflush(fpdd);   /* ensure header is written even if program exits early */
     }
 
