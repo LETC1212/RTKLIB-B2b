@@ -68,7 +68,7 @@ extern int pbp_has_fixed_constraints(void);
 extern int pbp_apply_session_pseudoobs(rtk_t *rtk); /* legacy no-op */
 extern int pbp_get_fixed_arc_bias(gtime_t t, int sat, double *bias, double *var);
 extern int pbp_neq_accum_flag;
-extern int pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n, const double *v, const double *H, const double *R, int nv);
+extern int pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n, const double *v, const double *H, const double *R, int nv, const double *x_lin);
 extern int pbp_get_fixed_clock(gtime_t t, int sys_idx, double *clk);
 extern int pbp_collect_flag;
 extern int pbp_day_tag;
@@ -1526,7 +1526,7 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	int i,j,nv,info,svh[MAXOBS],brdc[MAXOBS],exc[MAXOBS]={0},stat=SOLQ_SINGLE;
 	double dpos[3] = {0x00};
 	/* OMC buffers for NEQ accumulation (paper Eq.3-5) */
-	double *v_omc=NULL, *H_omc=NULL, *R_omc=NULL;
+	double *v_omc=NULL, *H_omc=NULL, *R_omc=NULL, *xp_omc=NULL;
 	int nv_omc=0;
 
 	time2str(obs[0].time,str,2);
@@ -1565,6 +1565,7 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 	/* allocate OMC buffers if NEQ accumulation is active */
 	if (pbp_neq_accum_flag) {
 		v_omc=mat(nv,1); H_omc=mat(rtk->nx,nv); R_omc=mat(nv,nv);
+		xp_omc=mat(rtk->nx,1); /* linearization point (pre-filter state) */
 	}
 
 	for (i=0;i<MAX_ITER;i++) {
@@ -1578,12 +1579,16 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 			break;
 		}
 
-		/* save OMC (prefit) v, H, R for NEQ accumulation (paper Eq.3: l_e = OMC) */
-		if (pbp_neq_accum_flag && v_omc && H_omc && R_omc) {
+		/* save OMC (prefit) v, H, R and linearization point xp for NEQ.
+		 * CRITICAL: xp here is the PRE-FILTER state. After filter() below,
+		 * xp is modified in-place. The NEQ needs clk_ref = xp BEFORE filter
+		 * to be consistent with v_omc = y - h(xp_before_filter). */
+		if (pbp_neq_accum_flag && v_omc && H_omc && R_omc && xp_omc) {
 			nv_omc = nv;
 			matcpy(v_omc, v, nv, 1);
 			matcpy(H_omc, H, rtk->nx * nv, 1);
 			matcpy(R_omc, R, nv * nv, 1);
+			matcpy(xp_omc, xp, rtk->nx, 1); /* pre-filter state */
 		}
 
 		/* measurement update of ekf states */
@@ -1628,7 +1633,18 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                         pbp_epoch_collected = 1;
                     }
                 }
-                (void)pbp_neq_add_epoch(rtk, obs, n, v_omc, H_omc, R_omc, nv_omc);
+                {
+                    static int neq_fail_cnt=0, neq_call_cnt=0;
+                    int ok_neq = pbp_neq_add_epoch(rtk, obs, n, v_omc, H_omc, R_omc, nv_omc, xp_omc);
+                    neq_call_cnt++;
+                    if(!ok_neq) neq_fail_cnt++;
+                    if(neq_call_cnt % 300 == 0){
+                        trace(2,"[PBP-ppp] NEQ epoch %d: ok=%d fail=%d (%.1f%%)\n",
+                              neq_call_cnt,
+                              neq_call_cnt-neq_fail_cnt, neq_fail_cnt,
+                              neq_call_cnt>0 ? 100.0*neq_fail_cnt/neq_call_cnt : 0.0);
+                    }
+                }
             }
 
 			matcpy(rtk->xa,xp,rtk->nx,1);
@@ -1673,7 +1689,7 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
     }
     free(rs); free(dts); free(var); free(azel);
     free(xp); free(Pp); free(v); free(H); free(R);
-    free(v_omc); free(H_omc); free(R_omc);
+    free(v_omc); free(H_omc); free(R_omc); free(xp_omc);
 }
 
 
