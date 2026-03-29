@@ -1,2294 +1,1395 @@
 /*------------------------------------------------------------------------------
-* postpos.c : post-processing positioning
+* ppp_ar_passbypass.c : PPP ambiguity resolution using pass-by-pass method
 *
-*          Copyright (C) 2007-2020 by T.TAKASU, All rights reserved.
+* reference :
+*    Pass-by-Pass Ambiguity Resolution in Single GPS Receiver PPP Using
+*    Observations for Two Sequential Days: An Exploratory Study
 *
-* version : $Revision: 1.1 $ $Date: 2008/07/17 21:48:06 $
-* history : 2007/05/08  1.0  new
-*           2008/06/16  1.1  support binary inputs
-*           2009/01/02  1.2  support new rtk positioning api
-*           2009/09/03  1.3  fix bug on combined mode of moving-baseline
-*           2009/12/04  1.4  fix bug on obs data buffer overflow
-*           2010/07/26  1.5  support ppp-kinematic and ppp-static
-*                            support multiple sessions
-*                            support sbas positioning
-*                            changed api:
-*                                postpos()
-*                            deleted api:
-*                                postposopt()
-*           2010/08/16  1.6  fix bug sbas message synchronization (2.4.0_p4)
-*           2010/12/09  1.7  support qzss lex and ssr corrections
-*           2011/02/07  1.8  fix bug on sbas navigation data conflict
-*           2011/03/22  1.9  add function reading g_tec file
-*           2011/08/20  1.10 fix bug on freez if solstatic=single and combined
-*           2011/09/15  1.11 add function reading stec file
-*           2012/02/01  1.12 support keyword expansion of rtcm ssr corrections
-*           2013/03/11  1.13 add function reading otl and erp data
-*           2014/06/29  1.14 fix problem on overflow of # of satellites
-*           2015/03/23  1.15 fix bug on ant type replacement by rinex header
-*                            fix bug on combined filter for moving-base mode
-*           2015/04/29  1.16 fix bug on reading rtcm ssr corrections
-*                            add function to read satellite fcb
-*                            add function to read stec and troposphere file
-*                            add keyword replacement in dcb, erp and ionos file
-*           2015/11/13  1.17 add support of L5 antenna phase center parameters
-*                            add *.stec and *.trp file for ppp correction
-*           2015/11/26  1.18 support opt->freqopt(disable L2)
-*           2016/01/12  1.19 add carrier-phase bias correction by ssr
-*           2016/07/31  1.20 fix error message problem in rnx2rtkp
-*           2016/08/29  1.21 suppress warnings
-*           2016/10/10  1.22 fix bug on identification of file fopt->blq
-*           2017/06/13  1.23 add smoother of velocity solution
-*           2020/11/30  1.24 use API sat2freq() to get carrier frequency
-*                            fix bug on select best solution in static mode
-*                            delete function to use L2 instead of L5 PCV
-*                            writing solution file in binary mode
+* version : $Revision:$ $Date:$
+* history : 2025/01/xx  1.0  original
+*           2025/03/xx  2.0  paper-style one-shot NEQ re-solve
+*           2025/03/xx  3.0  arc IF/WL estimation rework
+*             [CHANGED] IF:  arc value = LAST epoch's float PPP state
+*             [CHANGED] WL:  arc value = inverse-variance weighted HMW mean
+*             [ADDED]   pbp_var_wl_epoch() via varerr() error propagation
+*             [REMOVED] IF inverse-variance weighted mean accumulation
+*             [REMOVED] WL simple mean + SIGMA_MW_CYC^2/nobs
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
-
-#include "B2b.h"
 #include "ppp_ar_passbypass.h"
 
-#define MIN(x,y)    ((x)<(y)?(x):(y))
-#define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
+#ifndef PBP_MAX2
+#define PBP_MAX2(a,b) (( (a) > (b) ) ? (a) : (b))
+#endif
 
-#define MAXPRCDAYS  100          /* max days of continuous processing */
-#define MAXINFILE   1000         /* max number of input files */
-#define MAXINVALIDTM 100         /* max number of invalid time marks */
+/* ── Pass-2 epoch diagnostics ─────────────────────────────────────────────── */
+int pbp_epoch_fix_count = 0;
+int pbp_epoch_total     = 0;
+int pbp_constraint_sum  = 0;
 
-#define EPSILON 1e-3
-
-/* constants/global variables ------------------------------------------------*/
-
-static pcvs_t pcvss={0};        /* satellite antenna parameters */
-static pcvs_t pcvsr={0};        /* receiver antenna parameters */
-static obs_t obss={0};          /* observation data */
-static nav_t navs={0};          /* navigation data */
-static sbs_t sbss={0};          /* sbas messages */
-static sta_t stas[MAXRCV];      /* station information */
-static int nepoch=0;            /* number of observation epochs */
-static int nitm  =0;            /* number of invalid time marks */
-static int iobsu =0;            /* current rover observation data index */
-static int iobsr =0;            /* current reference observation data index */
-static int isbs  =0;            /* current sbas message index */
-static int iitm  =0;            /* current invalid time mark index */
-static int reverse=0;           /* analysis direction (0:forward,1:backward) */
-static int aborts=0;            /* abort status */
-static sol_t *solf;             /* forward solutions */
-static sol_t *solb;             /* backward solutions */
-static double *rbf;             /* forward base positions */
-static double *rbb;             /* backward base positions */
-static int isolf=0;             /* current forward solutions index */
-static int isolb=0;             /* current backward solutions index */
-static char proc_rov [64]="";   /* rover for current processing */
-static char proc_base[64]="";   /* base station for current processing */
-static char rtcm_file[1024]=""; /* rtcm data file */
-static char rtcm_path[1024]=""; /* rtcm data path */
-static gtime_t invalidtm[MAXINVALIDTM]={{0}};/* invalid time marks */
-static rtcm_t rtcm;             /* rtcm control struct */
-static FILE *fp_rtcm=NULL;      /* rtcm data file pointer */
-
-static char B2b_files[MAXINFILE][1024]; /* B2b data files array */
-static int n_B2b_files = 0;     /* number of B2b files */
-static int cur_B2b_idx = 0;     /* current B2b file index */
-static char B2b_path[1024]=""; /* B2b data path */
-// static B2b_t B2b;              /* B2b control struct */
-static raw_t B2braw;              /* raw control struct */
-
-static FILE *fp_B2b=NULL;      /* B2b data file pointer */
-
-/* Reset B2b reader state (used for Pass-by-Pass re-processing).
- * This prevents Pass2 from inheriting EOF state from Pass1 and
- * accidentally reusing stale SSR corrections (which can make solutions
- * appear only near the last SSR epoch).
- */
-static void reset_B2b_reader(int day_idx)
+static void pbp_atexit_summary(void)
 {
-    if (n_B2b_files <= 0) return;
-
-    if (day_idx < 0) day_idx = 0;
-    if (day_idx >= n_B2b_files) day_idx = n_B2b_files - 1;
-
-    /* close any previously-open B2b file so the next update will reopen */
-    if (fp_B2b) {
-        fclose(fp_B2b);
-        fp_B2b = NULL;
-    }
-    B2b_path[0] = '\0';
-    cur_B2b_idx = day_idx;
-
-    trace(3, "[B2B] reset reader to index %d/%d\n", cur_B2b_idx + 1, n_B2b_files);
+    if (pbp_epoch_total == 0) return;
+    fprintf(stderr,
+        "\n======== PBP Pass-2 Epoch Fix Summary (atexit) ========\n"
+        "  Total epochs processed   : %d\n"
+        "  Epochs with AR fix       : %d  (%.1f%%)\n"
+        "  Epochs without AR fix    : %d  (%.1f%%)\n"
+        "  Total constraints applied: %d\n"
+        "  Avg constraints/epoch    : %.2f\n"
+        "  Avg constraints/fix_epoch: %.2f\n",
+        pbp_epoch_total,
+        pbp_epoch_fix_count,
+        100.0*pbp_epoch_fix_count/pbp_epoch_total,
+        pbp_epoch_total-pbp_epoch_fix_count,
+        100.0*(pbp_epoch_total-pbp_epoch_fix_count)/pbp_epoch_total,
+        pbp_constraint_sum,
+        (double)pbp_constraint_sum/pbp_epoch_total,
+        pbp_epoch_fix_count > 0
+            ? (double)pbp_constraint_sum/pbp_epoch_fix_count : 0.0);
+    if (pbp_epoch_fix_count == 0)
+        fprintf(stderr, "  *** WARNING: 0 fix epochs. Check pbp_ar_debug.log.\n");
+    fprintf(stderr, "=======================================================\n\n");
+    fflush(stderr);
 }
+extern void pbp_print_epoch_stats(void) { pbp_atexit_summary(); }
 
-static int processed_days = 0; /* counter for processed days */
-static FILE *fp_URA=NULL;      /* B2b URA data file pointer */
-
-/* ambiguity resolution data - defined globally for AR module access ---------*/
-satamb_t satamb[MAXSAT] = {{0}}; /* ambiguity arcs for all satellites */
-int n_ddamb = 0;                 /* number of DD ambiguities */
-ddamb_t ddamb[MAXSAT*MAXSAT] = {{0}}; /* DD ambiguity data */
-int refsat = 0;                  /* reference satellite for DD */
-/* show message and check break ----------------------------------------------*/
-static int checkbrk(const char *format, ...)
+static FILE *pbp_dbg_fp = NULL;
+static void pbp_dbg_open(void)
 {
-    va_list arg;
-    char buff[1024],*p=buff;
-    if (!*format) return showmsg("");
-    va_start(arg,format);
-    p+=vsprintf(p,format,arg);
-    va_end(arg);
-    if (*proc_rov&&*proc_base) sprintf(p," (%s-%s)",proc_rov,proc_base);
-    else if (*proc_rov ) sprintf(p," (%s)",proc_rov );
-    else if (*proc_base) sprintf(p," (%s)",proc_base);
-    return showmsg(buff);
-}
-/* Solution option to field separator ----------------------------------------*/
-/* Repeated from solution.c */
-static const char *opt2sep(const solopt_t *opt)
-{
-    if (!*opt->sep) return " ";
-    else if (!strcmp(opt->sep,"\\t")) return "\t";
-    return opt->sep;
-}
-/* output reference position -------------------------------------------------*/
-static void outrpos(FILE *fp, const double *r, const solopt_t *opt)
-{
-    double pos[3],dms1[3],dms2[3];
-
-    trace(3,"outrpos :\n");
-
-    const char *sep = opt2sep(opt);
-    if (opt->posf==SOLF_LLH||opt->posf==SOLF_ENU) {
-        ecef2pos(r,pos);
-        if (opt->degf) {
-            deg2dms(pos[0]*R2D,dms1,5);
-            deg2dms(pos[1]*R2D,dms2,5);
-            fprintf(fp,"%3.0f%s%02.0f%s%08.5f%s%4.0f%s%02.0f%s%08.5f%s%10.4f",
-                    dms1[0],sep,dms1[1],sep,dms1[2],sep,dms2[0],sep,dms2[1],
-                    sep,dms2[2],sep,pos[2]);
-        }
-        else {
-            fprintf(fp,"%13.9f%s%14.9f%s%10.4f",pos[0]*R2D,sep,pos[1]*R2D,
-                    sep,pos[2]);
-        }
-    }
-    else if (opt->posf==SOLF_XYZ) {
-        fprintf(fp,"%14.4f%s%14.4f%s%14.4f",r[0],sep,r[1],sep,r[2]);
-    }
-}
-/* output header -------------------------------------------------------------*/
-static void outheader(FILE *fp, const char **file, int n, const prcopt_t *popt,
-                      const solopt_t *sopt)
-{
-    const char *s1[]={"GPST","UTC","JST"};
-    gtime_t ts,te;
-    double t1,t2;
-    int i,j,w1,w2;
-    char s2[32],s3[32];
-
-    trace(3,"outheader: n=%d\n",n);
-
-    if (sopt->posf==SOLF_NMEA||sopt->posf==SOLF_STAT) {
-        return;
-    }
-    if (sopt->outhead) {
-        if (!*sopt->prog) {
-            fprintf(fp,"%s program   : RTKLIB ver.%s %s\n",COMMENTH,VER_RTKLIB,PATCH_LEVEL);
-        }
-        else {
-            fprintf(fp,"%s program   : %s\n",COMMENTH,sopt->prog);
-        }
-        for (i=0;i<n;i++) {
-            fprintf(fp,"%s inp file  : %s\n",COMMENTH,file[i]);
-        }
-        for (i=0;i<obss.n;i++)    if (obss.data[i].rcv==1) break;
-        for (j=obss.n-1;j>=0;j--) if (obss.data[j].rcv==1) break;
-        if (j<i) {fprintf(fp,"\n%s no rover obs data\n",COMMENTH); return;}
-        ts=obss.data[i].time;
-        te=obss.data[j].time;
-        t1=time2gpst(ts,&w1);
-        t2=time2gpst(te,&w2);
-        if (sopt->times>=1) {
-            ts=gpst2utc(ts);
-            te=gpst2utc(te);
-        }
-        if (sopt->times==2) {
-            ts=timeadd(ts,9*3600.0);
-            te=timeadd(te,9*3600.0);
-        }
-        time2str(ts,s2,1);
-        time2str(te,s3,1);
-        fprintf(fp,"%s obs start : %s %s (week%04d %8.1fs)\n",COMMENTH,s2,s1[sopt->times],w1,t1);
-        fprintf(fp,"%s obs end   : %s %s (week%04d %8.1fs)\n",COMMENTH,s3,s1[sopt->times],w2,t2);
-    }
-    if (sopt->outopt) {
-        outprcopt(fp,popt);
-    }
-    if (PMODE_DGPS<=popt->mode&&popt->mode<=PMODE_FIXED&&popt->mode!=PMODE_MOVEB) {
-        fprintf(fp,"%s ref pos   :",COMMENTH);
-        outrpos(fp,popt->rb,sopt);
-        fprintf(fp,"\n");
-    }
-    if (sopt->outhead||sopt->outopt) fprintf(fp,"%s\n",COMMENTH);
-
-    outsolhead(fp,sopt);
-}
-/* search next observation data index ----------------------------------------*/
-static int nextobsf(const obs_t *obs, int *i, int rcv)
-{
-    double tt;
-    int n;
-
-    for (;*i<obs->n;(*i)++) if (obs->data[*i].rcv==rcv) break;
-    for (n=0;*i+n<obs->n;n++) {
-        tt=timediff(obs->data[*i+n].time,obs->data[*i].time);
-        if (obs->data[*i+n].rcv!=rcv||tt>DTTOL) break;
-    }
-    return n;
-}
-static int nextobsb(const obs_t *obs, int *i, int rcv)
-{
-    double tt;
-    int n;
-
-    for (;*i>=0;(*i)--) if (obs->data[*i].rcv==rcv) break;
-    for (n=0;*i-n>=0;n++) {
-        tt=timediff(obs->data[*i-n].time,obs->data[*i].time);
-        if (obs->data[*i-n].rcv!=rcv||tt<-DTTOL) break;
-    }
-    return n;
-}
-/* update rtcm ssr correction ------------------------------------------------*/
-static void update_rtcm_ssr(gtime_t time)
-{
-    char path[1024];
-    int i;
-
-    /* open or swap rtcm file */
-    reppath(rtcm_file,path,time,"","");
-
-    if (strcmp(path,rtcm_path)) {
-        strcpy(rtcm_path,path);
-
-        if (fp_rtcm) fclose(fp_rtcm);
-        fp_rtcm=fopen(path,"rb");
-        if (fp_rtcm) {
-            rtcm.time=time;
-            input_rtcm3f(&rtcm,fp_rtcm);
-            trace(2,"rtcm file open: %s\n",path);
-        }
-    }
-    if (!fp_rtcm) return;
-
-    /* read rtcm file until current time */
-    while (timediff(rtcm.time,time)<1E-3) {
-        if (input_rtcm3f(&rtcm,fp_rtcm)<-1) break;
-
-        /* update ssr corrections */
-        for (i=0;i<MAXSAT;i++) {
-            if (!rtcm.ssr[i].update||
-                rtcm.ssr[i].iod[0]!=rtcm.ssr[i].iod[1]||
-                timediff(time,rtcm.ssr[i].t0[0])<-1E-3) continue;
-            navs.ssr[i]=rtcm.ssr[i];
-            rtcm.ssr[i].update=0;
-        }
+    if (!pbp_dbg_fp) {
+        pbp_dbg_fp = fopen("pbp_ar_debug.log", "w");
+        if (pbp_dbg_fp)
+            fprintf(pbp_dbg_fp,
+                "# PBP AR diagnostic log\n"
+                "# Columns: epoch_time  n_active  nv_raw  nv_after_gate  "
+                "applied  nv_constraints  res_vals...\n");
     }
 }
 
-/* update B2b ssr correction ------------------------------------------------*/
-static void update_B2b_ssr(gtime_t time, int format)
+/* ── Constants ──────────────────────────────────────────────────────────── */
+#ifndef PBP_EPOCH_GAP_SEC
+#define PBP_EPOCH_GAP_SEC 60.0
+#endif
+
+static int pbp_has_slip(const obsd_t *obs);   /* forward decl */
+
+#define CLIGHT       299792458.0
+#define FREQ_GPS_L1  1.57542E9
+#define FREQ_GPS_L2  1.22760E9
+#ifndef FREQ_BDS_B1I
+#define FREQ_BDS_B1I 1561.098e6
+#endif
+#ifndef FREQ_BDS_B3I
+#define FREQ_BDS_B3I 1268.520e6
+#endif
+
+/* Fallback WL variance for epochs where varerr returns 0 */
+#define SIGMA_MW_CYC 0.35
+
+/* ── PPP state index helpers (must match ppp.c layout) ───────────────────── */
+static inline int pbp_NP(const prcopt_t *opt) { return opt->dynamics ? 9 : 3; }
+static inline int pbp_NC(const prcopt_t *opt)
 {
-    char path[1024];
-    char obstime_str[128] = {0};
-    char B2btime_str[128] = {0};
-    char t0_str[6][64];
-    char satid[8];
-    int i, j;
-    int found = 0;
-
-    if (format != STRFMT_SINO && format != STRFMT_UNICORE) {
-        printf("Error Format: %d \n", format);
-    }
-
-    time2str(time, obstime_str, 3);
-    trace(22, "update_B2b_ssr  : obstime=%s \n", obstime_str);
-    trace(22, "---------------------------------------------------------\n");
-
-    /* If current file is still open, continue using it - nothing to do here */
-    if (fp_B2b != NULL) {
-        /* File already open, skip to data reading section */
-    } else {
-        /* Need to open a new file - start from cur_B2b_idx (next file after EOF) */
-        found = 0;
-        for (j = cur_B2b_idx; j < n_B2b_files; j++) {
-            reppath(B2b_files[j], path, time, "", "");
-
-            /* Try to open this file */
-            FILE *fp_test = fopen(path, "rb");
-            if (fp_test) {
-                fclose(fp_test);
-                found = 1;
-                cur_B2b_idx = j;
-                trace(2, "Found B2b file [%d/%d]: %s\n", j+1, n_B2b_files, path);
-                printf("Found B2b file [%d/%d]: %s\n", j+1, n_B2b_files, path);
-                break;
-            }
-        }
-
-        /* If no file found, return */
-        if (!found) {
-            trace(3, "No B2b file available for time: %s\n", obstime_str);
-            return;
-        }
-
-        /* Open the found file */
-        fp_B2b = fopen(path, "rb");
-        if (!fp_B2b) {
-            trace(1, "Failed to open B2b file: %s\n", path);
-            printf("Error: Failed to open B2b file: %s\n", path);
-            return;
-        }
-
-        /* Initialize for new file */
-        strcpy(B2b_path, path);
-        init_raw(&B2braw, format);
-        B2braw.time = time;
-
-        /* Read first data from file and check validity */
-        int first_ret = input_rawf(&B2braw, format, fp_B2b);
-        if (first_ret == -2 || first_ret == -1) {
-            /* File is EOF or has error on first read - skip this file */
-            trace(1, "ERROR: B2b file empty or immediate error: %s (ret=%d)\n", path, first_ret);
-            printf("ERROR: B2b file empty or immediate error: %s (ret=%d)\n", path, first_ret);
-            printf("  Skipping this file, will try next file on next call\n");
-            fclose(fp_B2b);
-            fp_B2b = NULL;
-            B2b_path[0] = '\0';
-            cur_B2b_idx++;  /* Skip to next file */
-            return;
-        }
-        /* If first_ret == 0 (no complete message yet), continue - this is normal for binary format syncing */
-
-        trace(2, "Opened B2b file [%d/%d]: %s, first B2b time=%s\n",
-              cur_B2b_idx+1, n_B2b_files, path, time_str(B2braw.time,3));
-        printf("Opened B2b file [%d/%d]: %s\n", cur_B2b_idx+1, n_B2b_files, path);
-    }
-
-    if (!fp_B2b) {
-        trace(3, "No B2b file available for time: %s\n", obstime_str);
-        return;
-    }
-    
-    /* read B2b data until current time (assuming B2b data is directly available) */
-    int max_iterations = 10000;  /* Reduced from 100000 to prevent long hangs */
-    int iter_count = 0;
-    gtime_t last_time = B2braw.time;
-    int no_progress_count = 0;
-
-    trace(3, "Starting B2b read loop: B2braw.time=%s, obs_time=%s\n",
-          time_str(B2braw.time,3), obstime_str);
-
-    while (timediff(B2braw.time, time) < 1E-3) {
-        int ret;
-
-        /* Check iteration limit to prevent infinite loop */
-        if (++iter_count > max_iterations) {
-            trace(1, "ERROR: B2b read loop exceeded %d iterations at %s\n",
-                  max_iterations, obstime_str);
-            printf("ERROR: B2b read loop exceeded %d iterations, stopping\n", max_iterations);
-            printf("  B2braw.time=%s, obs_time=%s, file=%s\n",
-                   time_str(B2braw.time,3), obstime_str, B2b_path);
-            break;
-        }
-
-        /* Check if B2braw.time is progressing */
-        if (timediff(B2braw.time, last_time) < 1E-6) {
-            if (++no_progress_count > 1000) {  /* Reduced from 50000 */
-                trace(1, "ERROR: B2b time not progressing after 1000 reads at %s\n", obstime_str);
-                printf("ERROR: B2b time not progressing after 1000 reads\n");
-                printf("  B2braw.time=%s stuck, obs_time=%s, file=%s\n",
-                       time_str(B2braw.time,3), obstime_str, B2b_path);
-                break;
-            }
-        } else {
-            no_progress_count = 0;
-            last_time = B2braw.time;
-        }
-
-        ret = input_rawf(&B2braw, format, fp_B2b);
-
-        /* Handle EOF, error, or no data (ret <= 0) */
-        if (ret <= 0) {
-            if (ret == -2) {
-                /* EOF - close file and move to next file index */
-                trace(2, "B2b file EOF reached: %s (cur_B2b_idx=%d/%d)\n",
-                      B2b_path, cur_B2b_idx, n_B2b_files);
-                printf("B2b file EOF reached: %s\n", B2b_path);
-                cur_B2b_idx++;
-                trace(2, "Advanced to next B2b file index: %d/%d\n", cur_B2b_idx, n_B2b_files);
-                printf("  Advanced to next file index [%d/%d] for next day\n",
-                       cur_B2b_idx+1, n_B2b_files);
-                if (fp_B2b) {
-                    fclose(fp_B2b);
-                    fp_B2b = NULL;
-                }
-                B2b_path[0] = '\0';
-            } else if (ret == -1) {
-                /* Error - close file and skip to next file */
-                trace(1, "B2b file read error: %s\n", B2b_path);
-                printf("B2b file read error: %s\n", B2b_path);
-                cur_B2b_idx++;  /* Skip problematic file */
-                if (fp_B2b) {
-                    fclose(fp_B2b);
-                    fp_B2b = NULL;
-                }
-                B2b_path[0] = '\0';
-            } else if (ret == 0) {
-                /* No complete message yet - keep file open for next call */
-                trace(3, "B2b no complete message read, will continue next call\n");
-                /* Do NOT close file or increment index - continue from here next time */
-            }
-            break;
-        }
-        time2str(B2braw.time, B2btime_str, 3);
-
-        /* Liu@APM: This output may log a message where timediff(time, B2b.B2bssr[i].t0[0]) > -1E-3, so be cautious */
-        if (B2braw.num_PPPB2BINF01 != 0) trace(22, "Message 1(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF01, B2btime_str, B2braw.geoprn);
-        if (B2braw.num_PPPB2BINF02 != 0) trace(22, "Message 2(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF02, B2btime_str, B2braw.geoprn);
-        if (B2braw.num_PPPB2BINF03 != 0) trace(22, "Message 3(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF03, B2btime_str, B2braw.geoprn);
-        if (B2braw.num_PPPB2BINF04 != 0) trace(22, "Message 4(%d) Detected at %s GeoPRN is %d \n", B2braw.num_PPPB2BINF04, B2btime_str, B2braw.geoprn);
-        trace(22, "---------------------------------------------------------\n");
-
-        /* update ssr corrections */
-        for (i = 0; i < MAXSAT; i++) {
-            if (i==0) continue;
-            satno2id(i, satid);
-            if (!B2braw.nav.B2bssr[i].update) continue;
-            if (B2braw.num_PPPB2BINF02 != 0) {
-                if (timediff(time, B2braw.time) < -1E-3) continue;
-                if (abs(timediff(B2braw.nav.B2bssr[i].t0[0], navs.B2bssr[i].t0[0])) < 1E-3) {
-                    if (!checkout_B2beph(&B2braw.nav.B2bssr[i], &navs.B2bssr[i])) {
-                        printf("error: Prn(%d) B2b_Eph is different from before one!", B2braw.geoprn);
-                        trace(22, "error: Prn(%d) B2b_Eph is different from before one!", B2braw.geoprn);
-                    }
-                    B2braw.nav.B2bssr[i].update = 0; /* Consider identical data as already updated */
-                    continue; /* Do not update identical data */
-                }
-                else B2braw.nav.B2bssr[i].udi[0] = timediff(B2braw.nav.B2bssr[i].t0[0], navs.B2bssr[i].t0[0]);
-
-                if (B2braw.nav.B2bssr[i].iodcorr[0] != B2braw.nav.B2bssr[i].iodcorr[1]) {
-                    satno2id(i, satid);
-                    printf("warning: %s eph(%d) and clk(%d) iodcorr is different! \n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    trace(22, "warning: %s eph(%d) and clk(%d) iodcorr is different!\n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    B2braw.nav.B2bssr[i].update = 0;
-                    continue;
-                }
-            } 
-
-            if (B2braw.num_PPPB2BINF03 != 0) {
-                if (timediff(time, B2braw.time) < -1E-3) continue;
-
-                if (abs(timediff(B2braw.nav.B2bssr[i].t0[1], navs.B2bssr[i].t0[1])) < 1E-3) {
-                    if (!checkout_B2bcbia(&B2braw.nav.B2bssr[i], &navs.B2bssr[i])) {
-                        printf("error: Prn(%d) B2b_Cbia is different from before one!", B2braw.geoprn);
-                        trace(22, "error: Prn(%d) B2b_Cbia is different from before one!", B2braw.geoprn);
-                    }
-                    B2braw.nav.B2bssr[i].update = 0; /* Consider identical data as already updated; note that if the IOD for type 3 remains the same, udi will stay 0 since cbias values rarely change */
-                    continue; /* Do not update identical data */
-                }
-                else B2braw.nav.B2bssr[i].udi[1] = timediff(B2braw.nav.B2bssr[i].t0[1], navs.B2bssr[i].t0[1]);
-                if (B2braw.nav.B2bssr[i].iodcorr[0] != B2braw.nav.B2bssr[i].iodcorr[1]) {
-                    satno2id(i, satid);
-                    printf("warning: %s eph(%d) and clk(%d) iodcorr is different! \n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    trace(22, "warning: %s eph(%d) and clk(%d) iodcorr is different!\n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    B2braw.nav.B2bssr[i].update = 0;
-                    continue;
-                    /* It might have been carried over by other correction messages */
-                }
-            }
-
-            if (B2braw.num_PPPB2BINF04 != 0) {
-                if (timediff(time, B2braw.time) < -1E-3) continue;
-
-                if (abs(timediff(B2braw.nav.B2bssr[i].t0[2], navs.B2bssr[i].t0[2])) < 1E-3) {
-                    if (!checkout_B2bclk(&B2braw.nav.B2bssr[i], &navs.B2bssr[i])) {
-                        printf("error: Prn(%d) B2b_Clk is different from before one!", B2braw.geoprn);
-                        trace(22, "error: Prn(%d) B2b_Clk is different from before one!", B2braw.geoprn);
-                    }
-                    B2braw.nav.B2bssr[i].update = 0; /* Consider identical data as already updated */
-                    continue; /* Do not update identical data */
-                }
-                else B2braw.nav.B2bssr[i].udi[2] = timediff(B2braw.nav.B2bssr[i].t0[2], navs.B2bssr[i].t0[2]);
-                if (B2braw.nav.B2bssr[i].iodcorr[0] != B2braw.nav.B2bssr[i].iodcorr[1]) {
-                    satno2id(i, satid);
-                    printf("warning: %s eph(%d) and clk(%d) iodcorr is different! \n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    trace(22, "warning: %s eph(%d) and clk(%d) iodcorr is different!\n", satid, B2braw.nav.B2bssr[i].iodcorr[0], B2braw.nav.B2bssr[i].iodcorr[1]);
-                    B2braw.nav.B2bssr[i].update = 0;
-                    continue;
-                    /* It might have been carried over by other correction messages */
-                }
-            }
-            
-            navs.B2bssr[i] = B2braw.nav.B2bssr[i];
-
-            /* Iterate through the t0 array, convert all its elements to strings, and output them */
-            for (int j = 0; j < 6; j++) {
-                time2str(navs.B2bssr[i].t0[j], t0_str[j], 3);
-            }
-            satno2id(i, satid);
-            trace(22, "navs.B2bssr[%d] update: %d\n", i, navs.B2bssr[i].update);
-            trace(22, "B2bssr[%d]: %s tod = %d, verify_sow = %d ,t0 = [%s, %s, %s, %s, %s, %s], udi = [%f, %f, %f, %f, %f, %f], "
-                      "iodssr = [%d, %d, %d, %d, %d, %d], iodp = [%d, %d], iodn = %d, iodcorr = [%d, %d, %d, %d], "
-                      "deph = [%f, %f, %f], ddeph = [%f, %f, %f], "
-                      "ura = %d, cbias = [%f, %f, %f], dclk = [%f, %f, %f], update = %d\n",
-                      i, satid, navs.B2bssr[i].sow, navs.B2bssr[i].verify_sow,
-                      t0_str[0], t0_str[1], t0_str[2], t0_str[3], t0_str[4], t0_str[5],  
-                      navs.B2bssr[i].udi[0], navs.B2bssr[i].udi[1], navs.B2bssr[i].udi[2], navs.B2bssr[i].udi[3],
-                      navs.B2bssr[i].udi[4], navs.B2bssr[i].udi[5],
-                      navs.B2bssr[i].iodssr[0], navs.B2bssr[i].iodssr[1], navs.B2bssr[i].iodssr[2],
-                      navs.B2bssr[i].iodssr[3], navs.B2bssr[i].iodssr[4], navs.B2bssr[i].iodssr[5],
-                      navs.B2bssr[i].iodp[0], navs.B2bssr[i].iodp[1], navs.B2bssr[i].iodn,
-                      navs.B2bssr[i].iodcorr[0], navs.B2bssr[i].iodcorr[1], navs.B2bssr[i].iodcorr[2], navs.B2bssr[i].iodcorr[3],
-                      navs.B2bssr[i].deph[0], navs.B2bssr[i].deph[1], navs.B2bssr[i].deph[2],
-                      navs.B2bssr[i].ddeph[0], navs.B2bssr[i].ddeph[1], navs.B2bssr[i].ddeph[2],
-                      navs.B2bssr[i].ura,
-                      navs.B2bssr[i].cbias[0], navs.B2bssr[i].cbias[1], navs.B2bssr[i].cbias[2],
-                      navs.B2bssr[i].dclk[0], navs.B2bssr[i].dclk[1], navs.B2bssr[i].dclk[2],
-                      navs.B2bssr[i].update);
-
-            trace(22, "---------------------------------------------------------\n");
-
-            B2braw.nav.B2bssr[i].update = 0;
-        }
-        B2braw.num_PPPB2BINF01 = 0;
-        B2braw.num_PPPB2BINF02 = 0;
-        B2braw.num_PPPB2BINF03 = 0;
-        B2braw.num_PPPB2BINF04 = 0;
-    }
+#ifdef BDS2BDS3
+    return NSYS + 1;
+#else
+    return NSYS;
+#endif
+}
+static inline int pbp_NT(const prcopt_t *opt)
+{
+    return (opt->tropopt < TROPOPT_EST) ? 0
+         : (opt->tropopt == TROPOPT_EST) ? 1 : 3;
+}
+static inline int pbp_NI(const prcopt_t *opt)
+{
+    return (opt->ionoopt == IONOOPT_EST) ? MAXSAT : 0;
+}
+static inline int pbp_ND(const prcopt_t *opt) { return (opt->nf >= 3) ? 1 : 0; }
+static inline int pbp_NR(const prcopt_t *opt)
+{
+    return pbp_NP(opt)+pbp_NC(opt)+pbp_NT(opt)+pbp_NI(opt)+pbp_ND(opt);
+}
+static inline int pbp_IB(int sat, int f, const prcopt_t *opt)
+{
+    return pbp_NR(opt) + MAXSAT * f + (sat - 1);
 }
 
-
-
-/* input obs data, navigation messages and sbas correction -------------------*/
-static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
+/* ── Dual-frequency pair ─────────────────────────────────────────────────── */
+static int get_dual_freq_pair(int sat, double *f1, double *f2)
 {
-    gtime_t time={0};
-    int i,nu,nr,n=0;
-    double dt,dt_next;
-    int format;
-
-    trace(3,"\ninfunc  : dir=%d iobsu=%d iobsr=%d isbs=%d\n",reverse,iobsu,iobsr,isbs);
-    // traceobs_impl(22,obss.data,obss.n);
-
-    if (0<=iobsu&&iobsu<obss.n) {
-        settime((time=obss.data[iobsu].time));
-        if (checkbrk("processing : %s Q=%d",time_str(time,0),solq)) {
-            aborts=1; showmsg("aborted"); return -1;
-        }
-    }
-    if (!reverse) { /* input forward data */
-        if ((nu=nextobsf(&obss,&iobsu,1))<=0) return -1;
-        if (popt->intpref) {
-            /* for interpolation, find first base timestamp after rover timestamp */
-            for (;(nr=nextobsf(&obss,&iobsr,2))>0;iobsr+=nr)
-                if (timediff(obss.data[iobsr].time,obss.data[iobsu].time)>-DTTOL) break;
-        }
-        else {
-            /* if not interpolating, find closest timestamp */
-            dt=timediff(obss.data[iobsr].time,obss.data[iobsu].time);
-            for (i=iobsr;(nr=nextobsf(&obss,&i,2))>0;iobsr=i,i+=nr) {
-                dt_next=timediff(obss.data[i].time,obss.data[iobsu].time);
-                if (fabs(dt_next)>fabs(dt)) break;
-                dt=dt_next;
-            }
-        }
-        nr=nextobsf(&obss,&iobsr,2);
-        if (nr<=0) {
-            nr=nextobsf(&obss,&iobsr,2);
-        }
-        for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu+i];
-        for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr+i];
-        iobsu+=nu;
-
-        /* update sbas corrections */
-        while (isbs<sbss.n) {
-            time=gpst2time(sbss.msgs[isbs].week,sbss.msgs[isbs].tow);
-
-            if (getbitu(sbss.msgs[isbs].msg,8,6)!=9) { /* except for geo nav */
-                sbsupdatecorr(sbss.msgs+isbs,&navs);
-            }
-            if (timediff(time,obs[0].time)>-1.0-DTTOL) break;
-            isbs++;
-        }
-        /* update rtcm ssr corrections */
-        if (*rtcm_file) {
-            update_rtcm_ssr(obs[0].time);
-        }
-
-         if (n_B2b_files > 0) {
-            // int format = STRFMT_SINAN;
-            // strcpy(rtcm_file, "../../../../GNSS_DataSet/20241002APMALIC/sinan/Cor_202410020000.log");
-            format = popt->B2b_format;
-            update_B2b_ssr(obs[0].time,format);
-        }
-
-    }
-    else { /* input backward data */
-        if ((nu=nextobsb(&obss,&iobsu,1))<=0) return -1;
-        if (popt->intpref) {
-            /* for interpolation, find first base timestamp before rover timestamp */
-            for (;(nr=nextobsb(&obss,&iobsr,2))>0;iobsr-=nr)
-                if (timediff(obss.data[iobsr].time,obss.data[iobsu].time)<DTTOL) break;
-        }
-        else {
-            /* if not interpolating, find closest timestamp */
-            dt=iobsr>=0?timediff(obss.data[iobsr].time,obss.data[iobsu].time):0;
-            for (i=iobsr;(nr=nextobsb(&obss,&i,2))>0;iobsr=i,i-=nr) {
-                dt_next=timediff(obss.data[i].time,obss.data[iobsu].time);
-                if (fabs(dt_next)>fabs(dt)) break;
-                dt=dt_next;
-            }
-        }
-        nr=nextobsb(&obss,&iobsr,2);
-        for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu-nu+1+i];
-        for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr-nr+1+i];
-        iobsu-=nu;
-
-        /* update sbas corrections */
-        while (isbs>=0) {
-            time=gpst2time(sbss.msgs[isbs].week,sbss.msgs[isbs].tow);
-
-            if (getbitu(sbss.msgs[isbs].msg,8,6)!=9) { /* except for geo nav */
-                sbsupdatecorr(sbss.msgs+isbs,&navs);
-            }
-            if (timediff(time,obs[0].time)<1.0+DTTOL) break;
-            isbs--;
-        }
-    }
-    return n;
-}
-/* output to file message of invalid time mark -------------------------------*/
-static void outinvalidtm(FILE *fptm, const solopt_t *opt, const gtime_t tm)
-{
-    gtime_t time = tm;
-    double gpst;
-    const double secondsInAWeek = 604800;
-    int week,timeu;
-    char s[100];
-
-    timeu=opt->timeu<0?0:(opt->timeu>20?20:opt->timeu);
-
-    if (opt->times>=TIMES_UTC) time=gpst2utc(time);
-    if (opt->times==TIMES_JST) time=timeadd(time,9*3600.0);
-
-    if (opt->timef) time2str(time,s,timeu);
-    else {
-        gpst=time2gpst(time,&week);
-        if (secondsInAWeek-gpst < 0.5/pow(10.0,timeu)) {
-            week++;
-            gpst=0.0;
-        }
-        sprintf(s,"%4d   %*.*f",week,6+(timeu<=0?0:timeu+1),timeu,gpst);
-    }
-    strcat(s, "   Q=0, Time mark is not valid\n");
-
-    fwrite(s,strlen(s),1,fptm);
-}
-/* fill structure sol_t for time mark ----------------------------------------*/
-static sol_t fillsoltm(const sol_t solold, const sol_t solnew, const gtime_t tm)
-{
-    gtime_t t1={0},t2={0};
-    sol_t sol=solold;
-    int i=0;
-
-    if (solold.stat == 0 || solnew.stat == 0) {
-        sol.stat = 0;
-    } else {
-        sol.stat = (solold.stat > solnew.stat) ? solold.stat : solnew.stat;
-    }
-    sol.ns = (solold.ns < solnew.ns) ? solold.ns : solnew.ns;
-    sol.ratio = (solold.ratio < solnew.ratio) ? solold.ratio : solnew.ratio;
-
-    /* interpolation position and speed of time mark */
-    t1 = solold.time;
-    t2 = solnew.time;
-    sol.time = tm;
-
-    for (i=0;i<6;i++)
-    {
-        sol.rr[i] = solold.rr[i] + timediff(tm,t1) / timediff(t2,t1) * (solnew.rr[i] - solold.rr[i]);
-    }
-
-    return sol;
-}
-
-/* carrier-phase bias correction by ssr --------------------------------------*/
-static void corr_phase_bias_ssr(obsd_t *obs, int n, const nav_t *nav)
-{
-    double freq;
-    uint8_t code;
-    int i,j;
-
-    for (i=0;i<n;i++) for (j=0;j<NFREQ;j++) {
-        code=obs[i].code[j];
-
-        if ((freq=sat2freq(obs[i].sat,code,nav))==0.0) continue;
-
-        /* correct phase bias (cyc) */
-        obs[i].L[j]-=nav->ssr[obs[i].sat-1].pbias[code-1]*freq/CLIGHT;
-    }
-}
-/* process positioning -------------------------------------------------------*/
-static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *sopt,
-                    rtk_t *rtk, int mode)
-{
-    gtime_t time={0};
-    sol_t sol={{0}},oldsol={{0}},newsol={{0}};
-    obsd_t *obs_ptr = (obsd_t *)malloc(sizeof(obsd_t)*MAXOBS*2); /* for rover and base */
-    double rb[3]={0};
-    int i,nobs,n,solstatic,num=0,pri[]={6,1,2,3,4,5,1,6};
-    static gtime_t day1_start = {0};  /* first day start time for AR */
-    static int current_day = -1;      /* current processing day for AR */
-
-    trace(3,"procpos : mode=%d\n",mode); /* 0=single dir, 1=combined */
-    char ura_filename[256];
-    sprintf(ura_filename, "./b2b_ura_data_%s.txt", popt->sationname);
-
-    // if (!fp_URA) {
-    //     fp_URA = fopen(ura_filename, "w+");
-    //     if (!fp_URA) {
-    //         fprintf(stderr, "Error: Failed to open B2b URA data file!\n");
-    //         return;
-    //     }
-    //     trace(2, "B2b URA data file opened successfully.\n");
-    // }
-
-    solstatic=sopt->solstatic&&
-              (popt->mode==PMODE_STATIC||popt->mode==PMODE_STATIC_START||popt->mode==PMODE_PPP_STATIC);
-    
-    rtcm_path[0]='\0';
-
-    while ((nobs=inputobs(obs_ptr,rtk->sol.stat,popt))>=0) {
-
-        /* exclude satellites */
-        for (i=n=0;i<nobs;i++) {
-            if ((satsys(obs_ptr[i].sat,NULL)&popt->navsys)&&
-                popt->exsats[obs_ptr[i].sat-1]!=1) obs_ptr[n++]= obs_ptr[i];
-        }
-        if (n<=0) continue;
-
-        /* carrier-phase bias correction */
-        // if (!strstr(popt->pppopt,"-ENA_FCB")) {
-        //     corr_phase_bias_ssr(obs_ptr,n,&navs);
-        // }
-        if (!rtkpos(rtk, obs_ptr,n,&navs)) {
-            if (rtk->sol.eventime.time != 0) {
-                if (mode == SOLMODE_SINGLE_DIR) {
-                    outinvalidtm(fptm, sopt, rtk->sol.eventime);
-                } else if (!reverse&&nitm<MAXINVALIDTM) {
-                    invalidtm[nitm++] = rtk->sol.eventime;
-                }
-            }
-            continue;
-        }
-
-         
-/* Pass-by-Pass AR: collection only during Pass-1.
- * OLD CODE REMOVED HERE:
- *   - pbp_apply_flag driven epoch-wise apply_ar_fixed() update
- *   - all dynamic Kalman constraint injection inside procpos()
- */
-{
-    extern int pbp_day_tag, pbp_collect_flag;
-    extern int pbp_epoch_collected; /* set by pppos() when it collected for NEQ */
-
-    if (pbp_collect_flag && !pbp_epoch_collected) {
-        int cur_day = pbp_day_tag;
-
-        if (cur_day < 0) {
-            extern int pbp_base_day_id; /* defined in ppp_ar_passbypass.c */
-            int week = 0;
-            double sow = time2gpst(obs_ptr[0].time, &week);
-            int day_id = week * 7 + (int)floor(sow / 86400.0);
-            if (pbp_base_day_id < 0) pbp_base_day_id = day_id;
-            cur_day = day_id - pbp_base_day_id;
-        }
-
-        if ((cur_day == 0 || cur_day == 1) && rtk->sol.stat == SOLQ_PPP) {
-            (void)collect_ambiguities_epoch(rtk, obs_ptr, n, cur_day);
-        }
-    }
-}
-
-if (mode==SOLMODE_SINGLE_DIR) {    /* forward or backward */
-            if (!solstatic) {
-                outsol(fp,&rtk->sol,rtk->rb,sopt);
-            }
-            else if (time.time==0||pri[rtk->sol.stat]<=pri[sol.stat]) {
-                sol=rtk->sol;
-                for (i=0;i<3;i++) rb[i]=rtk->rb[i];
-                if (time.time==0||timediff(rtk->sol.time,time)<0.0) {
-                    time=rtk->sol.time;
-                }
-            }
-            /* check time mark */
-            if (rtk->sol.eventime.time != 0)
-            {
-                newsol = fillsoltm(oldsol,rtk->sol,rtk->sol.eventime);
-                num++;
-                if (!solstatic&&mode==SOLMODE_SINGLE_DIR) {
-                    outsol(fptm,&newsol,rb,sopt);
-                }
-            }
-            oldsol = rtk->sol;
-        }
-        else if (!reverse) { /* combined-forward */
-            if (isolf >= nepoch) {
-                free(obs_ptr);
-                return;
-            }
-            solf[isolf]=rtk->sol;
-            for (i=0;i<3;i++) rbf[i+isolf*3]=rtk->rb[i];
-            isolf++;
-        }
-        else { /* combined-backward */
-            if (isolb>=nepoch) {
-                free(obs_ptr);
-                return;
-            }
-            solb[isolb]=rtk->sol;
-            for (i=0;i<3;i++) rbb[i+isolb*3]=rtk->rb[i];
-            isolb++;
-        }
-    }
-    if (mode==SOLMODE_SINGLE_DIR && solstatic&&time.time!=0.0) {
-        sol.time=time;
-        outsol(fp,&sol,rb,sopt);
-    }
-
-    free(obs_ptr); /* moved from stack to heap to kill a stack overflow warning */
-}
-/* validation of combined solutions ------------------------------------------*/
-static int valcomb(const sol_t *solf, const sol_t *solb, double *rbf,
-        double *rbb, const prcopt_t *popt)
-{
-    double dr[3],var[3];
-    int i;
-    char tstr[32];
-
-    trace(4,"valcomb :\n");
-
-    /* compare forward and backward solution */
-    for (i=0;i<3;i++) {
-        dr[i]=solf->rr[i]-solb->rr[i];
-        if (popt->mode==PMODE_MOVEB) dr[i]-=(rbf[i]-rbb[i]);
-        var[i]=(double)solf->qr[i] + (double)solb->qr[i];
-    }
-    for (i=0;i<3;i++) {
-        if (dr[i]*dr[i]<=16.0*var[i]) continue; /* ok if in 4-sigma */
-
-        time2str(solf->time,tstr,2);
-        trace(2,"degrade fix to float: %s dr=%.3f %.3f %.3f std=%.3f %.3f %.3f\n",
-              tstr+11,dr[0],dr[1],dr[2],SQRT(var[0]),SQRT(var[1]),SQRT(var[2]));
-        return 0;
-    }
-    return 1;
-}
-/* combine forward/backward solutions and save results ---------------------*/
-static void combres(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *sopt)
-{
-    gtime_t time={0};
-    sol_t sols={{0}},sol={{0}},oldsol={{0}},newsol={{0}};
-    double tt,Qf[9],Qb[9],Qs[9],rbs[3]={0},rb[3]={0},rr_f[3],rr_b[3],rr_s[3];
-    int i,j,k,solstatic,num=0,pri[]={7,1,2,3,4,5,1,6};
-
-    trace(3,"combres : isolf=%d isolb=%d\n",isolf,isolb);
-
-    solstatic=sopt->solstatic&&
-              (popt->mode==PMODE_STATIC||popt->mode==PMODE_STATIC_START||popt->mode==PMODE_PPP_STATIC);
-
-    for (i=0,j=isolb-1;i<isolf&&j>=0;i++,j--) {
-        if ((tt=timediff(solf[i].time,solb[j].time))<-DTTOL) {
-            sols=solf[i];
-            for (k=0;k<3;k++) rbs[k]=rbf[k+i*3];
-            j++;
-        }
-        else if (tt>DTTOL) {
-            sols=solb[j];
-            for (k=0;k<3;k++) rbs[k]=rbb[k+j*3];
-            i--;
-        }
-        else if (pri[solf[i].stat]<pri[solb[j].stat]) {
-            sols=solf[i];
-            for (k=0;k<3;k++) rbs[k]=rbf[k+i*3];
-        }
-        else if (pri[solf[i].stat]>pri[solb[j].stat]) {
-            sols=solb[j];
-            for (k=0;k<3;k++) rbs[k]=rbb[k+j*3];
-        }
-        else {
-            sols=solf[i];
-            sols.time=timeadd(sols.time,-tt/2.0);
-
-            if ((popt->mode==PMODE_KINEMA||popt->mode==PMODE_MOVEB)&&
-                sols.stat==SOLQ_FIX) {
-
-                /* degrade fix to float if validation failed */
-                if (!valcomb(solf+i,solb+j,rbf+i*3,rbb+j*3,popt)) sols.stat=SOLQ_FLOAT;
-            }
-            for (k=0;k<3;k++) {
-                Qf[k+k*3]=solf[i].qr[k];
-                Qb[k+k*3]=solb[j].qr[k];
-            }
-            Qf[1]=Qf[3]=solf[i].qr[3];
-            Qf[5]=Qf[7]=solf[i].qr[4];
-            Qf[2]=Qf[6]=solf[i].qr[5];
-            Qb[1]=Qb[3]=solb[j].qr[3];
-            Qb[5]=Qb[7]=solb[j].qr[4];
-            Qb[2]=Qb[6]=solb[j].qr[5];
-
-            if (popt->mode==PMODE_MOVEB) {
-                for (k=0;k<3;k++) rr_f[k]=solf[i].rr[k]-rbf[k+i*3];
-                for (k=0;k<3;k++) rr_b[k]=solb[j].rr[k]-rbb[k+j*3];
-                if (smoother(rr_f,Qf,rr_b,Qb,3,rr_s,Qs)) continue;
-                for (k=0;k<3;k++) sols.rr[k]=rbs[k]+rr_s[k];
-            }
-            else {
-                if (smoother(solf[i].rr,Qf,solb[j].rr,Qb,3,sols.rr,Qs)) continue;
-            }
-            sols.qr[0]=(float)Qs[0];
-            sols.qr[1]=(float)Qs[4];
-            sols.qr[2]=(float)Qs[8];
-            sols.qr[3]=(float)Qs[1];
-            sols.qr[4]=(float)Qs[5];
-            sols.qr[5]=(float)Qs[2];
-
-            /* smoother for velocity solution */
-            if (popt->dynamics) {
-                for (k=0;k<3;k++) {
-                    Qf[k+k*3]=solf[i].qv[k];
-                    Qb[k+k*3]=solb[j].qv[k];
-                }
-                Qf[1]=Qf[3]=solf[i].qv[3];
-                Qf[5]=Qf[7]=solf[i].qv[4];
-                Qf[2]=Qf[6]=solf[i].qv[5];
-                Qb[1]=Qb[3]=solb[j].qv[3];
-                Qb[5]=Qb[7]=solb[j].qv[4];
-                Qb[2]=Qb[6]=solb[j].qv[5];
-                if (smoother(solf[i].rr+3,Qf,solb[j].rr+3,Qb,3,sols.rr+3,Qs)) continue;
-                sols.qv[0]=(float)Qs[0];
-                sols.qv[1]=(float)Qs[4];
-                sols.qv[2]=(float)Qs[8];
-                sols.qv[3]=(float)Qs[1];
-                sols.qv[4]=(float)Qs[5];
-                sols.qv[5]=(float)Qs[2];
-            }
-        }
-        if (!solstatic) {
-            outsol(fp,&sols,rbs,sopt);
-        }
-        else if (time.time==0||pri[sols.stat]<=pri[sol.stat]) {
-            sol=sols;
-            for (k=0;k<3;k++) rb[k]=rbs[k];
-            if (time.time==0||timediff(sols.time,time)<0.0) {
-                time=sols.time;
-            }
-        }
-        if (iitm < nitm && timediff(invalidtm[iitm],sols.time)<0.0)
-        {
-            outinvalidtm(fptm,sopt,invalidtm[iitm]);
-            iitm++;
-        }
-        if (sols.eventime.time != 0)
-        {
-            newsol = fillsoltm(oldsol,sols,sols.eventime);
-            num++;
-            if (!solstatic) {
-                outsol(fptm,&newsol,rb,sopt);
-            }
-        }
-        oldsol = sols;
-    }
-    if (solstatic&&time.time!=0.0) {
-        sol.time=time;
-        outsol(fp,&sol,rb,sopt);
-    }
-}
-/* read prec ephemeris, sbas data, tec grid and open rtcm --------------------*/
-static void readpreceph(const char **infile, int n, const prcopt_t *prcopt,
-                        nav_t *nav, sbs_t *sbs)
-{
-    seph_t seph0={0};
-    int i;
-    const char *ext;
-
-    trace(2,"readpreceph: n=%d\n",n);
-
-    nav->ne=nav->nemax=0;
-    nav->nc=nav->ncmax=0;
-    sbs->n =sbs->nmax =0;
-
-    /* read precise ephemeris files */
-    for (i=0;i<n;i++) {
-        if (strstr(infile[i],"%r")||strstr(infile[i],"%b")) continue;
-        readsp3(infile[i],nav,0);
-    }
-    /* read precise clock files */
-    for (i=0;i<n;i++) {
-        if (strstr(infile[i],"%r")||strstr(infile[i],"%b")) continue;
-        readrnxc(infile[i],nav);
-    }
-    /* read sbas message files */
-    for (i=0;i<n;i++) {
-        if (strstr(infile[i],"%r")||strstr(infile[i],"%b")) continue;
-        sbsreadmsg(infile[i],prcopt->sbassatsel,sbs);
-    }
-    /* allocate sbas ephemeris */
-    nav->ns=nav->nsmax=NSATSBS*2;
-    if (!(nav->seph=(seph_t *)malloc(sizeof(seph_t)*nav->ns))) {
-         showmsg("error : sbas ephem memory allocation");
-         trace(1,"error : sbas ephem memory allocation");
-         return;
-    }
-    for (i=0;i<nav->ns;i++) nav->seph[i]=seph0;
-
-    /* set rtcm file and initialize rtcm struct */
-    rtcm_file[0]=rtcm_path[0]='\0'; fp_rtcm=NULL;
-
-    for (i=0;i<n;i++) {
-        if ((ext=strrchr(infile[i],'.'))&&
-            (!strcmp(ext,".rtcm3")||!strcmp(ext,".RTCM3"))) {
-            strcpy(rtcm_file,infile[i]);
-            init_rtcm(&rtcm);
-            break;
-        }
-    }
-
-       /* set B2b files and initialize B2b struct */
-    /* Only initialize B2b files on first call (when n_B2b_files is 0) */
-    /* This preserves cur_B2b_idx across multiple days of processing */
-    if (n_B2b_files == 0) {
-        cur_B2b_idx = 0;
-        B2b_path[0]='\0';
-        fp_B2b=NULL;
-
-        /* Store all B2b files found in input */
-        for (i=0;i<n && n_B2b_files < MAXINFILE;i++) {
-            if ((ext=strrchr(infile[i],'.'))&&
-                (!strcmp(ext,".b2b")||!strcmp(ext,".B2b"))) {
-                strcpy(B2b_files[n_B2b_files],infile[i]);
-                n_B2b_files++;
-                printf("B2b file %d: %s\n", n_B2b_files, infile[i]);
-            }
-        }
-
-        /* Initialize B2b raw struct if we have at least one B2b file */
-        if (n_B2b_files > 0) {
-            init_raw(&B2braw,prcopt->B2b_format);
-            trace(2, "Initialized B2braw, Total B2b files found: %d\n", n_B2b_files);
-            printf("Total B2b files found: %d\n", n_B2b_files);
-        }
-    } else {
-        /* B2b files already initialized, keep existing cur_B2b_idx */
-        /* BUT: need to re-initialize B2braw after free_raw() in freepreceph() */
-        if (n_B2b_files > 0) {
-            init_raw(&B2braw,prcopt->B2b_format);
-            trace(2, "Re-initialized B2braw for new day processing\n");
-        }
-        trace(2, "B2b files already initialized, cur_B2b_idx=%d/%d\n", cur_B2b_idx, n_B2b_files);
-        printf("Day %d: Continuing with B2b file index [%d/%d] (next file after previous EOF)\n",
-               processed_days+1, cur_B2b_idx+1, n_B2b_files);
-    }
-
-}
-/* free prec ephemeris and sbas data -----------------------------------------*/
-static void freepreceph(nav_t *nav, sbs_t *sbs)
-{
-    int i;
-
-    trace(3,"freepreceph:\n");
-
-    free(nav->peph); nav->peph=NULL; nav->ne=nav->nemax=0;
-    free(nav->pclk); nav->pclk=NULL; nav->nc=nav->ncmax=0;
-    free(nav->seph); nav->seph=NULL; nav->ns=nav->nsmax=0;
-    free(sbs->msgs); sbs->msgs=NULL; sbs->n =sbs->nmax =0;
-    for (i=0;i<nav->nt;i++) {
-        free(nav->tec[i].data);
-        free(nav->tec[i].rms );
-    }
-    free(nav->tec ); nav->tec =NULL; nav->nt=nav->ntmax=0;
-
-    if (fp_rtcm) fclose(fp_rtcm);
-    free_rtcm(&rtcm);
-    /* close B2b file pointer */
-    if (fp_B2b) {
-        fclose(fp_B2b);
-        fp_B2b = NULL;
-    }
-    B2b_path[0] = '\0';
-    free_raw(&B2braw);
-}
-/* read obs and nav data -----------------------------------------------------*/
-static int readobsnav(gtime_t ts, gtime_t te, double ti, const char **infile,
-                      const int *index, int n, const prcopt_t *prcopt,
-                      obs_t *obs, nav_t *nav, sta_t *sta)
-{
-    int i,j,ind=0,nobs=0,rcv=1;
-
-    trace(3,"readobsnav: ts=%s n=%d\n",time_str(ts,0),n);
-
-    obs->data=NULL; obs->n =obs->nmax =0;
-    nav->eph =NULL; nav->n =nav->nmax =0;
-    nav->geph=NULL; nav->ng=nav->ngmax=0;
-    /* free(nav->seph); */ /* is this needed to avoid memory leak??? */
-    nav->seph=NULL; nav->ns=nav->nsmax=0;
-    nepoch=0;
-
-    for (i=0;i<n;i++) {
-        if (checkbrk("")) return 0;
-
-        if (index[i]!=ind) {
-            if (obs->n>nobs) rcv++;
-            ind=index[i]; nobs=obs->n;
-        }
-        /* read rinex obs and nav file */
-        if (readrnxt(infile[i],rcv,ts,te,ti,prcopt->rnxopt[rcv<=1?0:1],obs,nav,
-                     rcv<=2?sta+rcv-1:NULL)<0) {
-            checkbrk("error : insufficient memory");
-            trace(1,"insufficient memory\n");
-            return 0;
-        }
-    }
-    if (obs->n<=0) {
-        checkbrk("error : no obs data");
-        trace(1,"\n");
-        return 0;
-    }
-    if (nav->n<=0&&nav->ng<=0&&nav->ns<=0) {
-        checkbrk("error : no nav data");
-        trace(1,"\n");
-        return 0;
-    }
-    /* sort observation data */
-    nepoch=sortobs(obs);
-
-    /* delete duplicated ephemeris */
-    uniqnav(nav);
-
-    /* set time span for progress display */
-    if (ts.time==0||te.time==0) {
-        for (i=0;   i<obs->n;i++) if (obs->data[i].rcv==1) break;
-        for (j=obs->n-1;j>=0;j--) if (obs->data[j].rcv==1) break;
-        if (i<j) {
-            if (ts.time==0) ts=obs->data[i].time;
-            if (te.time==0) te=obs->data[j].time;
-            settspan(ts,te);
-        }
-    }
-    return 1;
-}
-/* free obs and nav data -----------------------------------------------------*/
-static void freeobsnav(obs_t *obs, nav_t *nav)
-{
-    trace(3,"freeobsnav:\n");
-
-    free(obs->data); obs->data=NULL; obs->n =obs->nmax =0;
-    free(nav->eph ); nav->eph =NULL; nav->n =nav->nmax =0;
-    free(nav->geph); nav->geph=NULL; nav->ng=nav->ngmax=0;
-    free(nav->seph); nav->seph=NULL; nav->ns=nav->nsmax=0;
-}
-/* average of single position ------------------------------------------------*/
-static int avepos(double *ra, int rcv, const obs_t *obs, const nav_t *nav,
-                  const prcopt_t *opt)
-{
-    obsd_t data[MAXOBS];
-    gtime_t ts={0};
-    sol_t sol={{0}};
-    int i,j,n=0,m,iobs;
-    char msg[128];
-
-    trace(3,"avepos: rcv=%d obs.n=%d\n",rcv,obs->n);
-
-    for (i=0;i<3;i++) ra[i]=0.0;
-
-    for (iobs=0;(m=nextobsf(obs,&iobs,rcv))>0;iobs+=m) {
-
-        for (i=j=0;i<m&&i<MAXOBS;i++) {
-            data[j]=obs->data[iobs+i];
-            if ((satsys(data[j].sat,NULL)&opt->navsys)&&
-                opt->exsats[data[j].sat-1]!=1) j++;
-        }
-        if (j<=0||!screent(data[0].time,ts,ts,1.0)) continue; /* only 1 hz */
-
-        if (!pntpos(data,j,nav,opt,&sol,NULL,NULL,msg)) continue;
-
-        for (i=0;i<3;i++) ra[i]+=sol.rr[i];
-        n++;
-    }
-    if (n<=0) {
-        trace(1,"no average of base station position\n");
-        return 0;
-    }
-    for (i=0;i<3;i++) ra[i]/=n;
-    return 1;
-}
-/* station position from file ------------------------------------------------*/
-static int getstapos(const char *file, const char *name, double *r)
-{
-    FILE *fp;
-    char buff[256],sname[256],*p;
-    const char *q;
-    double pos[3];
-
-    trace(3,"getstapos: file=%s name=%s\n",file,name);
-
-    if (!(fp=fopen(file,"r"))) {
-        trace(1,"station position file open error: %s\n",file);
-        return 0;
-    }
-    while (fgets(buff,sizeof(buff),fp)) {
-        if ((p=strchr(buff,'%'))) *p='\0';
-        
-        if (sscanf(buff,"%lf %lf %lf %255s",pos,pos+1,pos+2,sname)<4) continue;
-        
-        for (p=sname,q=name;*p&&*q;p++,q++) {
-            if (toupper((int)*p)!=toupper((int)*q)) break;
-        }
-        if (!*p) {
-            pos[0]*=D2R;
-            pos[1]*=D2R;
-            pos2ecef(pos,r);
-            fclose(fp);
-            return 1;
-        }
-    }
-    fclose(fp);
-    trace(1,"no station position: %s %s\n",name,file);
+    int sys = satsys(sat, NULL);
+    if (!f1 || !f2) return 0;
+    if (sys == SYS_GPS) { *f1 = FREQ_GPS_L1; *f2 = FREQ_GPS_L2; return 1; }
+    if (sys == SYS_CMP) { *f1 = FREQ_BDS_B1I; *f2 = FREQ_BDS_B3I; return 1; }
     return 0;
 }
-/* antenna phase center position ---------------------------------------------*/
-static int antpos(prcopt_t *opt, int rcvno, const obs_t *obs, const nav_t *nav,
-                  const sta_t *sta, const char *posfile)
+
+/* ── HMW wide-lane in cycles (system-aware) ──────────────────────────────── */
+static double mw_wl_cycles(const obsd_t *obs)
 {
-    double *rr=rcvno==1?opt->ru:opt->rb,del[3],pos[3],dr[3]={0};
-    int i,postype=rcvno==1?opt->rovpos:opt->refpos;
-    char *name;
+    double f1, f2, lam_wl, mw_m;
+    if (!obs) return 0.0;
+    if (!get_dual_freq_pair(obs->sat, &f1, &f2)) return 0.0;
+	int frq2 = (obs->L[1] == 0.0) ? 2 : 1;
+    if (obs->L[0]==0.0||obs->L[frq2]==0.0||obs->P[0]==0.0||obs->P[frq2]==0.0)
+        return 0.0;
+    lam_wl = CLIGHT / (f1 - f2);
+    mw_m = (obs->L[0] - obs->L[frq2]) * CLIGHT / (f1 - f2)
+          - (f1 * obs->P[0] + f2 * obs->P[frq2]) / (f1 + f2);
+    return mw_m / lam_wl;
+}
 
-    trace(3,"antpos  : rcvno=%d\n",rcvno);
+/* ── pbp_var_wl_epoch : single-epoch HMW variance via varerr() ──────────────
+ *
+ * [NEW in v3.0]
+ *
+ * HMW combination (matching mw_wl_cycles above):
+ *   mw_cyc = (L1_cyc - L2_cyc) - (f1·P1 + f2·P2) / ((f1+f2)·lam_wl)
+ *
+ * Rearranging in terms of the four raw observations (L1_m, L2_m, P1, P2):
+ *   mw_cyc  =  a·L1_m/lam_wl  +  b·L2_m/lam_wl
+ *           −  c·P1/lam_wl    −  d·P2/lam_wl
+ * where
+ *   a =  f1/(f1−f2)    L1 phase coefficient
+ *   b = -f2/(f1−f2)    L2 phase coefficient
+ *   c =  f1/(f1+f2)    P1 code coefficient
+ *   d =  f2/(f1+f2)    P2 code coefficient
+ *
+ * Error propagation (L1/L2/P1/P2 assumed independent):
+ *   var_wl_ep = (a²·var_L1 + b²·var_L2 + c²·var_P1 + d²·var_P2) / lam_wl²
+ *
+ * varerr() argument f:
+ *   0 → L1 phase  (frq=0, code=0)    snr = snr0
+ *   1 → P1 code   (frq=0, code=1)    snr = snr0
+ *   2 → L2 phase  (frq=1, code=0)    snr = snr1
+ *   3 → P2 code   (frq=1, code=1)    snr = snr1
+ *
+ * Returns var_wl in cycles², or 0.0 on any invalid input.
+ * ────────────────────────────────────────────────────────────────────────── */
+static double pbp_var_wl_epoch(int sat, int sys, double el,
+                                double snr0, double snr1,
+                                const prcopt_t *opt, const obsd_t *obs)
+{
+    double f1, f2, lam_wl;
+    double var_L1, var_L2, var_P1, var_P2;
+	int frq2 = (obs->L[1] == 0.0) ? 2 : 1;
+    if (!obs || !opt) return 0.0;
+    if (el <= 0.0) return 0.0;
+    if (obs->L[0]==0.0||obs->L[frq2]==0.0||obs->P[0]==0.0||obs->P[frq2]==0.0)
+        return 0.0;
+    if (!get_dual_freq_pair(sat, &f1, &f2)) return 0.0;
 
-    if (postype==POSOPT_SINGLE) { /* average of single position */
-        if (!avepos(rr,rcvno,obs,nav,opt)) {
-            showmsg("error : station pos computation");
-            return 0;
-        }
+    lam_wl = CLIGHT / (f1 - f2);
+
+    /* pbp_varerr wraps the static varerr() in ppp.c (declared in header) */
+    var_L1 = pbp_varerr(sat, sys, el, snr0, 0, opt, obs);  /* L1 phase */
+    var_P1 = pbp_varerr(sat, sys, el, snr0, 1, opt, obs);  /* P1 code  */
+    var_L2 = pbp_varerr(sat, sys, el, snr1, 2, opt, obs);  /* L2 phase */
+    var_P2 = pbp_varerr(sat, sys, el, snr1, 3, opt, obs);  /* P2 code  */
+
+    if (var_L1<=0.0 || var_L2<=0.0 || var_P1<=0.0 || var_P2<=0.0) return 0.0;
+
+    const double a =  f1 / (f1 - f2);   /* L1 coefficient */
+    const double b = -f2 / (f1 - f2);   /* L2 coefficient */
+    const double c =  f1 / (f1 + f2);   /* P1 coefficient */
+    const double d =  f2 / (f1 + f2);   /* P2 coefficient */
+
+    return (a*a*var_L1 + b*b*var_L2 + c*c*var_P1 + d*d*var_P2)
+           / (lam_wl * lam_wl);
+}
+
+static int NINT(double x) { return (int)floor(x + 0.5); }
+
+
+static double fix_decision_prob(double frac_abs, double sigma)
+{
+    if (sigma <= 0.0) return (frac_abs < 0.2) ? 1.0 : 0.0;
+    const double s2 = sqrt(2.0) * sigma;
+    double xi = 1.0;
+    for (int k = 1; k <= 200; k++) {
+        double lo = (k - frac_abs) / s2;
+        double hi = (k + frac_abs) / s2;
+        double term = erfc(lo) - erfc(hi);
+        xi -= term;
     }
-    else if (postype==POSOPT_FILE) { /* read from position file */
-        name=stas[rcvno==1?0:1].name;
-        if (!getstapos(posfile,name,rr)) {
-            showmsg("error : no position of %s in %s",name,posfile);
-            return 0;
+    return xi;
+}
+
+extern int fix_ambiguity(double N_float, double std, double threshold, int *fixed)
+{
+    const double FRAC_THRESH = 0.2;    /* paper criterion: |frac| < 0.2 cyc */
+    const double XI_THRESH   = 0.999;  /* fixable probability threshold 99.9% */
+
+    const int    N_fix = NINT(N_float);
+    const double frac  = fabs(N_float - (double)N_fix);
+
+    *fixed = 0;
+    if (frac >= FRAC_THRESH) return N_fix;
+
+    /* compute decision function ξ (Eq. 14) */
+    double xi = fix_decision_prob(frac, std);
+    if (xi >= XI_THRESH) *fixed = 1;
+
+    return N_fix;
+}
+
+/* ── Global ambiguity database ───────────────────────────────────────────── */
+extern satamb_t satamb[MAXSAT];
+extern int      n_ddamb ;
+extern ddamb_t  ddamb[MAXSAT * MAXSAT];
+extern int      refsat  ;
+int      pbp_base_day_id = -1;
+
+/* ── init_arc_data ───────────────────────────────────────────────────────── */
+extern void init_arc_data(void)
+{
+    for (int i = 0; i < MAXSAT; i++) satamb[i].n = 0;
+    pbp_base_day_id = -1;
+    pbp_epoch_fix_count = 0;
+    pbp_epoch_total     = 0;
+    pbp_constraint_sum  = 0;
+    static int atexit_registered = 0;
+    if (!atexit_registered) { atexit(pbp_atexit_summary); atexit_registered = 1; }
+    pbp_dbg_open();
+}
+
+/* ── print_arc_summary ───────────────────────────────────────────────────── */
+extern void print_arc_summary(void)
+{
+    int i, j, total_arcs = 0, sats_with_both_days = 0;
+    int arcs_day0 = 0, arcs_day1 = 0, arcs_other = 0;
+    char satid[8];
+    printf("\n========== Ambiguity Arc Summary ==========\n");
+    for (i = 0; i < MAXSAT; i++)
+        for (j = 0; j < satamb[i].n; j++) {
+            if      (satamb[i].arc[j].day == 0) arcs_day0++;
+            else if (satamb[i].arc[j].day == 1) arcs_day1++;
+            else                                 arcs_other++;
         }
+    printf("Arc distribution: day0=%d, day1=%d, other=%d\n",
+           arcs_day0, arcs_day1, arcs_other);
+    for (i = 0; i < MAXSAT; i++) {
+        if (satamb[i].n == 0) continue;
+        satno2id(i + 1, satid);
+        int has_day0 = 0, has_day1 = 0;
+        for (j = 0; j < satamb[i].n; j++) {
+            if (satamb[i].arc[j].day==0 && satamb[i].arc[j].nobs>=10) has_day0=1;
+            if (satamb[i].arc[j].day==1 && satamb[i].arc[j].nobs>=10) has_day1=1;
+        }
+        if (has_day0 && has_day1) sats_with_both_days++;
+        printf("%s: %d arcs [%s]\n", satid, satamb[i].n,
+               (has_day0&&has_day1)?"day0+day1":(has_day0?"day0 only":"day1 only"));
+        for (j = 0; j < satamb[i].n; j++)
+            printf("  Arc %d: day=%d nobs=%d N_IF=%.3f±%.3f N_WL=%.3f±%.4f\n",
+                   j, satamb[i].arc[j].day, satamb[i].arc[j].nobs,
+                   satamb[i].arc[j].N_IF,  sqrt(satamb[i].arc[j].var_IF),
+                   satamb[i].arc[j].N_WL,  sqrt(satamb[i].arc[j].var_WL));
+        total_arcs += satamb[i].n;
     }
-    else if (postype==POSOPT_RINEX) { /* get from rinex header */
-        if (norm(stas[rcvno==1?0:1].pos,3)<=0.0) {
-            showmsg("error : no position in rinex header");
-            trace(1,"no position in rinex header\n");
-            return 0;
-        }
-        /* add antenna delta unless already done in antpcv() */
-        if (!strcmp(opt->anttype[rcvno],"*")) {
-            if (stas[rcvno==1?0:1].deltype==0) { /* enu */
-                for (i=0;i<3;i++) del[i]=stas[rcvno==1?0:1].del[i];
-                del[2]+=stas[rcvno==1?0:1].hgt;
-                ecef2pos(stas[rcvno==1?0:1].pos,pos);
-                enu2ecef(pos,del,dr);
-            }  else { /* xyz */
-                for (i=0;i<3;i++) dr[i]=stas[rcvno==1?0:1].del[i];
+    printf("Total arcs: %d\n", total_arcs);
+    printf("Satellites with both day0 and day1 (>=10 obs): %d\n", sats_with_both_days);
+    printf("==========================================\n\n");
+}
+
+/* ── collect_ambiguities ─────────────────────────────────────────────────────
+ *
+ * v3.0 changes:
+ *
+ * A. IF ambiguity (N_IF / var_IF)                 [CHANGED]
+ *    The arc value is ALWAYS overwritten with the CURRENT EPOCH's float PPP
+ *    state.  When the loop exits, the arc stores the LAST EPOCH's estimate,
+ *    which is the Kalman filter's best (most propagated) value for this arc.
+ *    [REMOVED] Inverse-variance weighted mean accumulation.
+ *
+ * B. WL ambiguity (N_WL / var_WL)                [CHANGED]
+ *    Inverse-variance weighted mean of per-epoch HMW values, accumulated
+ *    in ambarc_t.wl_wsum / ambarc_t.wl_wxsum (two new fields).
+ *    Single-epoch HMW variance computed by pbp_var_wl_epoch() which calls
+ *    varerr() through the pbp_varerr() wrapper in ppp.c.
+ *    [REMOVED] Simple running mean + fixed SIGMA_MW_CYC^2/nobs.
+ *
+ * Arc-break logic (LLI slip or time gap > PBP_EPOCH_GAP_SEC) unchanged.
+ *-----------------------------------------------------------------------------*/
+extern int collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n,
+                                int day, satamb_t *satamb)
+{
+    const double ARC_GAP = PBP_EPOCH_GAP_SEC;
+    int count = 0;
+    if (!rtk || !obs || n <= 0 || !satamb) return 0;
+
+    for (int i = 0; i < n; i++) {
+        int sat = obs[i].sat;
+        gtime_t time = obs[i].time;
+        if (sat <= 0 || sat > MAXSAT) continue;
+
+        int idx_IF = pbp_IB(sat, 0, &rtk->opt);
+        if (idx_IF < 0 || idx_IF >= rtk->nx) continue;
+
+        double N_IF   = rtk->x[idx_IF];
+        double var_IF = rtk->P[idx_IF + idx_IF * rtk->nx];
+        if (N_IF == 0.0) continue;
+
+        double N_WL = mw_wl_cycles(&obs[i]);
+        if (N_WL == 0.0) continue;
+
+        /* ── arc break detection ─────────────────────────────────────────── */
+        const int has_slip = pbp_has_slip(&obs[i]);
+        int idx_arc = -1;
+        int is_new  = 0;
+
+        /* fast path: try last arc */
+        if (satamb[sat-1].n > 0) {
+            int last = satamb[sat-1].n - 1;
+            ambarc_t *a = &satamb[sat-1].arc[last];
+            if (!has_slip && a->day == day) {
+                double dt = timediff(time, a->te);
+                if (dt >= 0.0 && dt <= ARC_GAP) idx_arc = last;
             }
         }
-        for (i=0;i<3;i++) rr[i]=stas[rcvno==1?0:1].pos[i]+dr[i];
-    }
-    return 1;
-}
-/* open processing session ----------------------------------------------------*/
-static int openses(const prcopt_t *popt, const solopt_t *sopt,
-                   const filopt_t *fopt, nav_t *nav, pcvs_t *pcvs, pcvs_t *pcvr)
-{
-    trace(3,"openses :\n");
-
-    /* read satellite antenna parameters */
-    if (*fopt->satantp&&!(readpcv(fopt->satantp,pcvs))) {
-        showmsg("error : no sat ant pcv in %s",fopt->satantp);
-        trace(1,"sat antenna pcv read error: %s\n",fopt->satantp);
-        return 0;
-    }
-    /* read receiver antenna parameters */
-    if (*fopt->rcvantp&&!(readpcv(fopt->rcvantp,pcvr))) {
-        showmsg("error : no rec ant pcv in %s",fopt->rcvantp);
-        trace(1,"rec antenna pcv read error: %s\n",fopt->rcvantp);
-        return 0;
-    }
-    /* open geoid data */
-    if (sopt->geoid>0&&*fopt->geoid) {
-        if (!opengeoid(sopt->geoid,fopt->geoid)) {
-            showmsg("error : no geoid data %s",fopt->geoid);
-            trace(2,"no geoid data %s\n",fopt->geoid);
-        }
-    }
-    return 1;
-}
-/* close processing session ---------------------------------------------------*/
-static void closeses(nav_t *nav, pcvs_t *pcvs, pcvs_t *pcvr)
-{
-    trace(3,"closeses:\n");
-
-    /* free antenna parameters */
-    free(pcvs->pcv); pcvs->pcv=NULL; pcvs->n=pcvs->nmax=0;
-    free(pcvr->pcv); pcvr->pcv=NULL; pcvr->n=pcvr->nmax=0;
-
-    /* close geoid data */
-    closegeoid();
-
-    /* free erp data */
-    free(nav->erp.data); nav->erp.data=NULL; nav->erp.n=nav->erp.nmax=0;
-
-    /* close solution statistics and debug trace */
-    rtkclosestat();
-    traceclose();
-    B2b_traceclose();
-}
-/* set antenna parameters ----------------------------------------------------*/
-static void setpcv(gtime_t time, prcopt_t *popt, nav_t *nav, const pcvs_t *pcvs,
-                   const pcvs_t *pcvr, const sta_t *sta)
-{
-    pcv_t *pcv,pcv0={0};
-    double pos[3],del[3];
-    int i,j,mode=PMODE_DGPS<=popt->mode&&popt->mode<=PMODE_FIXED;
-    char id[64];
-
-    /* set satellite antenna parameters */
-    for (i=0;i<MAXSAT;i++) {
-        nav->pcvs[i]=pcv0;
-        if (!(satsys(i+1,NULL)&popt->navsys)) continue;
-        if (!(pcv=searchpcv(i+1,"",time,pcvs))) {
-            satno2id(i+1,id);
-            trace(4,"no satellite antenna pcv: %s\n",id);
-            continue;
-        }
-        nav->pcvs[i]=*pcv;
-    }
-    for (i=0;i<(mode?2:1);i++) {
-        popt->pcvr[i]=pcv0;
-        if (!strcmp(popt->anttype[i],"*")) { /* set by station parameters */
-            strcpy(popt->anttype[i],sta[i].antdes);
-            if (sta[i].deltype==1) { /* xyz */
-                if (norm(sta[i].pos,3)>0.0) {
-                    ecef2pos(sta[i].pos,pos);
-                    ecef2enu(pos,sta[i].del,del);
-                    for (j=0;j<3;j++) popt->antdel[i][j]=del[j];
-                }
-            }
-            else { /* enu */
-                for (j=0;j<3;j++) popt->antdel[i][j]=stas[i].del[j];
+        /* full search */
+        if (idx_arc < 0) {
+            for (int j = 0; j < satamb[sat-1].n; j++) {
+                ambarc_t *a = &satamb[sat-1].arc[j];
+                if (a->day != day || has_slip) continue;
+                double dt = timediff(time, a->te);
+                if (dt >= 0.0 && dt <= ARC_GAP) { idx_arc = j; break; }
             }
         }
-        if (!(pcv=searchpcv(0,popt->anttype[i],time,pcvr))) {
-            trace(2,"no receiver antenna pcv: %s\n",popt->anttype[i]);
-            *popt->anttype[i]='\0';
-            continue;
+
+        /* create new arc */
+        if (idx_arc < 0) {
+            if (satamb[sat-1].n >= MAXARC) continue;
+            idx_arc = satamb[sat-1].n++;
+            ambarc_t *a = &satamb[sat-1].arc[idx_arc];
+            memset(a, 0, sizeof(*a));
+            a->sat = sat; a->day = day;
+            a->ts  = time; a->te = time;
+            a->nobs = 0;
+            /* [CHANGED] WL accumulators start at zero */
+            a->wl_wsum  = 0.0;
+            a->wl_wxsum = 0.0;
+            /* fallback values overwritten immediately below */
+            a->N_WL   = N_WL;
+            a->var_WL = SIGMA_MW_CYC * SIGMA_MW_CYC;
+            a->fixed_WL = 0;
+            a->fixed_NL = 0;
+            is_new = 1;
         }
-        strcpy(popt->anttype[i],pcv->type);
-        popt->pcvr[i]=*pcv;
-    }
-}
-/* read ocean tide loading parameters ----------------------------------------*/
-static void readotl(prcopt_t *popt, const char *file, const sta_t *sta)
-{
-    int i,mode=PMODE_DGPS<=popt->mode&&popt->mode<=PMODE_FIXED;
 
-    for (i=0;i<(mode?2:1);i++) {
-        readblq(file,sta[i].name,popt->odisp[i]);
-    }
-}
-/* write header to output file -----------------------------------------------*/
-static int outhead(const char *outfile, const char **infile, int n,
-                   const prcopt_t *popt, const solopt_t *sopt)
-{
-    FILE *fp=stdout;
-    int need_header=1;
+        ambarc_t *a = &satamb[sat-1].arc[idx_arc];
+        a->te = time;
+        a->nobs++;
 
-    trace(3,"outhead: outfile=%s n=%d\n",outfile,n);
-
-    if (*outfile) {
-        createdir(outfile);
-
-        /*
-         * NOTE (patched): some drivers call outhead() multiple times for the same
-         * output file when splitting processing by time unit. The original code
-         * opened the file with "wb" unconditionally, which truncates the file and
-         * can leave only the last segment in .pos/.stat outputs.
-         *
-         * Here we only write the header if the file is empty; otherwise we append.
+            /* ── A. IF: arc-level inverse-variance weighted fusion ───────────────
+         * Using only the last epoch can keep arc variance too large and make
+         * cross-day DD NL fixing over-conservative. Here we fuse epoch IF
+         * estimates by 1/var weights to get a stable arc-level IF and variance.
          */
+        if (var_IF > 0.0) {
+            if (a->nobs <= 1 || a->var_IF <= 0.0) {
+                a->N_IF   = N_IF;
+                a->var_IF = var_IF;
+            }
+            else {
+                const double w_old = 1.0 / a->var_IF;
+                const double w_new = 1.0 / var_IF;
+                a->N_IF   = (a->N_IF * w_old + N_IF * w_new) / (w_old + w_new);
+                a->var_IF = 1.0 / (w_old + w_new);
+            }
+        }
+        /* if var_IF <= 0 (degenerate): keep previous valid variance */
+
+        /* ── B. WL: inverse-variance weighted mean of HMW epochs ────────────
+         * [CHANGED from v2: was simple mean + SIGMA_MW_CYC^2/nobs]
+         * pbp_var_wl_epoch() propagates the varerr() noise model through the
+         * HMW combination to obtain a physically-based per-epoch WL variance.
+         * ─────────────────────────────────────────────────────────────────── */
         {
-            FILE *ft=fopen(outfile,"rb");
-            if (ft) {
-                fseek(ft,0,SEEK_END);
-                if (ftell(ft)>0) need_header=0;
-                fclose(ft);
+            double el   = rtk->ssat[sat-1].azel[1];
+            double snr0 = SNR_UNIT * (double)rtk->ssat[sat-1].snr_rover[0];
+            double snr1 = SNR_UNIT * (double)rtk->ssat[sat-1].snr_rover[1];
+            int sys_sat = satsys(sat, NULL);
+
+            double vwl = pbp_var_wl_epoch(sat, sys_sat, el, snr0, snr1,
+                                           &rtk->opt, &obs[i]);
+            if (vwl > 0.0) {
+                double w = 1.0 / vwl;
+                a->wl_wsum  += w;
+                a->wl_wxsum += w * N_WL;
+                a->N_WL   = a->wl_wxsum / a->wl_wsum;
+                a->var_WL = 1.0 / a->wl_wsum;
+            } else if (is_new) {
+                /* first epoch, varerr invalid: use fallback simple assignment */
+                a->N_WL   = N_WL;
+                a->var_WL = SIGMA_MW_CYC * SIGMA_MW_CYC;
+            }
+		else {
+		a->nobs--;
+		}
+        }
+
+        count++;
+    }
+    return count;
+}
+
+/* ── Helpers ─────────────────────────────────────────────────────────────── */
+static double pbp_intdist(double x) { return fabs(x - floor(x + 0.5)); }
+
+static int pbp_has_slip(const obsd_t *obs)
+{
+    if (!obs) return 0;
+    for (int k = 0; k < NFREQ; k++)
+        if (obs->LLI[k] & 1) return 1;
+    return 0;
+}
+
+#ifndef PBP_SIDEREAL_SHIFT_GPS
+#define PBP_SIDEREAL_SHIFT_GPS 86164.09  /* GPS repeat ≈ 1 sidereal day (23h56m4s) */
+#endif
+#ifndef PBP_SIDEREAL_SHIFT_BDS
+#define PBP_SIDEREAL_SHIFT_BDS 86170.00  /* BDS GEO/IGSO repeat period */
+#endif
+
+static double pbp_default_shift_sec(int sat)
+{
+    int sys = satsys(sat, NULL);
+    if (sys == SYS_CMP) return PBP_SIDEREAL_SHIFT_BDS;
+    return PBP_SIDEREAL_SHIFT_GPS;
+}
+
+static double pbp_overlap_sec(gtime_t a0, gtime_t a1, gtime_t b0, gtime_t b1)
+{
+    double A0 = 0.0, A1 = timediff(a1, a0);
+    double B0 = -timediff(a0, b0), B1 = -timediff(a0, b1);
+    return fmax(0.0, fmin(A1, B1) - fmax(A0, B0));
+}
+
+/* ── select_best_arc_pair ─────────────────────────────────────────────────
+ * For a given satellite, find the day0 arc and day1 arc that correspond
+ * to the same sidereal repeat pass.
+ *
+ * Method: shift day0 arc times by the sidereal day offset, then find
+ * the day1 arc with maximum overlap. This is the ONLY selection criterion.
+ * The old "frac-based fallback" (select by WL small fractional part)
+ * had no theoretical basis and could match wrong arc pairs.
+ * ──────────────────────────────────────────────────────────────────────── */
+static int select_best_arc_pair(const satamb_t *satamb, int sat,
+                                 int *idx0, int *idx1)
+{
+    const satamb_t *sa;
+    double best_overlap = -1.0;
+    int best0 = -1, best1 = -1, best_minobs = -1;
+
+    if (!satamb || sat <= 0 || sat > MAXSAT) return 0;
+    sa = &satamb[sat-1];
+    if (sa->n <= 0) return 0;
+
+    const double shift = pbp_default_shift_sec(sat);
+    for (int i0 = 0; i0 < sa->n; i0++) {
+        const ambarc_t *a0 = &sa->arc[i0];
+        if (a0->day != 0 || a0->nobs < 10) continue;
+        gtime_t ts0s = timeadd(a0->ts, shift);
+        gtime_t te0s = timeadd(a0->te, shift);
+        for (int i1 = 0; i1 < sa->n; i1++) {
+            const ambarc_t *a1 = &sa->arc[i1];
+            if (a1->day != 1 || a1->nobs < 10) continue;
+            double ov = pbp_overlap_sec(ts0s, te0s, a1->ts, a1->te);
+            if (ov < 3.0 * 30.0) continue; /* minimum 90s overlap */
+            int minobs = a0->nobs < a1->nobs ? a0->nobs : a1->nobs;
+            if (ov > best_overlap + 1E-6 ||
+                (fabs(ov - best_overlap) <= 1E-6 && minobs > best_minobs)) {
+                best_overlap = ov; best0 = i0; best1 = i1; best_minobs = minobs;
             }
         }
-
-        if (!(fp=fopen(outfile,need_header?"wb":"ab"))) {
-            showmsg("error : open output file %s",outfile);
-            return 0;
-        }
     }
-
-    /* output header (only when creating a new/empty file) */
-    if (need_header) outheader(fp,infile,n,popt,sopt);
-
-    if (*outfile) fclose(fp);
-
+    if (best0 < 0 || best1 < 0) return 0;
+    if (idx0) *idx0 = best0; if (idx1) *idx1 = best1;
     return 1;
 }
-/* open output file for append -----------------------------------------------*/
-static FILE *openfile(const char *outfile)
-{
-    trace(3,"openfile: outfile=%s\n",outfile);
 
-    return !*outfile?stdout:fopen(outfile,"ab");
+/* ── compute_sd_across_days ─────────────────────────────────────────────── */
+static int compute_sd_across_days(const satamb_t *satamb, int sat,
+                                   double *SD_WL, double *var_SD_WL,
+                                   double *SD_IF,  double *var_SD_IF,
+                                   int *i0_out, int *i1_out)
+{
+    int i0 = -1, i1 = -1;
+    if (!SD_WL || !var_SD_WL || !SD_IF || !var_SD_IF) return 0;
+    if (!select_best_arc_pair(satamb, sat, &i0, &i1)) return 0;
+    if (i0_out) *i0_out = i0; if (i1_out) *i1_out = i1;
+
+    const ambarc_t *a0 = &satamb[sat-1].arc[i0];
+    const ambarc_t *a1 = &satamb[sat-1].arc[i1];
+
+    *SD_WL     = a1->N_WL   - a0->N_WL;
+    *var_SD_WL = a0->var_WL + a1->var_WL;
+    *SD_IF     = a1->N_IF   - a0->N_IF;
+
+    /* arc-level var_IF floor (3.2 mm)^2 per arc */
+   // const double var_arc_fl = 1e-5;
+   // double vIF0 = (a0->var_IF > 0 && a0->var_IF < var_arc_fl) ? var_arc_fl : a0->var_IF;
+   // double vIF1 = (a1->var_IF > 0 && a1->var_IF < var_arc_fl) ? var_arc_fl : a1->var_IF;
+   // *var_SD_IF = vIF0 + vIF1;
+   *var_SD_IF = a0->var_IF + a1->var_IF;
+    return 1;
 }
-/* Name time marks file ------------------------------------------------------*/
-static void namefiletm(char *outfiletm, const char *outfile)
-{
-    int i;
 
-    for (i=(int)strlen(outfile);i>0;i--) {
-        if (outfile[i] == '.') {
-            break;
-        }
+/* ── compute_dd_ambiguities ─────────────────────────────────────────────── */
+extern int compute_dd_ambiguities(const satamb_t *satamb, int refsat,
+                                   ddamb_t *ddamb, int *n_dd)
+{
+    int count = 0;
+    if (!satamb || !ddamb || !n_dd || refsat <= 0 || refsat > MAXSAT) return 0;
+    *n_dd = 0;
+    int sys_ref = satsys(refsat, NULL);
+    if (sys_ref == 0) return 0;
+    if(!pbp_bds_is_sidereal(refsat)&&satsys(refsat,NULL)==SYS_CMP)  return 0;
+
+    double SD_WL_ref=0, varSD_WL_ref=0, SD_IF_ref=0, varSD_IF_ref=0;
+    int ref_arc0=-1, ref_arc1=-1;
+    if (!compute_sd_across_days(satamb, refsat,
+                                 &SD_WL_ref, &varSD_WL_ref,
+                                 &SD_IF_ref,  &varSD_IF_ref,
+                                 &ref_arc0,   &ref_arc1)) return 0;
+
+    for (int sat = 1; sat <= MAXSAT; sat++) {
+        if (sat == refsat || satamb[sat-1].n <= 0) continue;
+        if (satsys(sat, NULL) != sys_ref) continue;
+        if(!pbp_bds_is_sidereal(sat)&&satsys(sat,NULL)==SYS_CMP)  continue;
+        double SD_WL_sat=0, varSD_WL_sat=0, SD_IF_sat=0, varSD_IF_sat=0;
+        int sat_arc0=-1, sat_arc1=-1;
+        if (!compute_sd_across_days(satamb, sat,
+                                     &SD_WL_sat, &varSD_WL_sat,
+                                     &SD_IF_sat,  &varSD_IF_sat,
+                                     &sat_arc0,   &sat_arc1)) continue;
+
+        ddamb[count].sat1      = refsat;
+        ddamb[count].sat2      = sat;
+        ddamb[count].DD_WL     = SD_WL_sat - SD_WL_ref;
+        ddamb[count].var_DD_WL = varSD_WL_sat + varSD_WL_ref;
+        ddamb[count].fixed_WL  = 0;
+        ddamb[count].fixed_NL  = 0;
+        ddamb[count].DD_IF     = SD_IF_sat - SD_IF_ref;
+        ddamb[count].var_DD_IF = varSD_IF_sat + varSD_IF_ref;
+        ddamb[count].arc1 = ref_arc0;
+        ddamb[count].arc2 = sat_arc0;
+        count++;
     }
-    /* if no file extension, then name time marks file as name of outfile + _events.pos */
-    if (i == 0) {
-        i = (int)strlen(outfile);
-    }
-    strncpy(outfiletm, outfile, i);
-    strcat(outfiletm, "_events.pos");
+    *n_dd = count;
+    return (count > 0) ? 1 : 0;
 }
-/* execute processing session ------------------------------------------------*/
-static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
-                   const solopt_t *sopt, const filopt_t *fopt, int flag,
-                   const char **infile, const int *index, int n, const char *outfile)
+
+/* ── fix_wl_nl_ambiguities ───────────────────────────────────────────────── */
+extern int fix_wl_nl_ambiguities(ddamb_t *ddamb, int n_dd)
 {
-    rtk_t *rtk_ptr = (rtk_t *)malloc(sizeof(rtk_t)); /* moved from stack to heap to avoid stack overflow warning */
-    prcopt_t popt_=*popt;
-    char B2btracefile[1024], tracefile[1024],statfile[1024],path[1024],outfiletm[1024]={0};
-    const char *ext;
-    int i,j,k,dcb_ok;
+    int n_fixed = 0;
+    const double th_wl = 0.20, th_nl = 0.20;
 
-    trace(3,"execses : n=%d outfile=%s\n",n,outfile);
+    for (int i = 0; i < n_dd; i++) {
+        int fixed = 0;
+        if (ddamb[i].var_DD_WL <= 0.0 || ddamb[i].var_DD_IF <= 0.0) continue;
+        double std_wl = sqrt(ddamb[i].var_DD_WL);
+        ddamb[i].DD_WL_fix = (double)fix_ambiguity(ddamb[i].DD_WL, std_wl, th_wl, &fixed);
+        ddamb[i].fixed_WL  = fixed;
+        if (!ddamb[i].fixed_WL) continue;
 
-    /* open debug trace */
-    if (flag&&sopt->trace>0) {
-        if (*outfile) {
-            strcpy(tracefile,outfile);
-            strcat(tracefile,".trace");
+        double f1=0, f2=0;
+        if (!get_dual_freq_pair(ddamb[i].sat1, &f1, &f2)) continue;
+        const double f1_2=f1*f1, f2_2=f2*f2, den=f1_2-f2_2;
+        if (fabs(den) < 1e-6) continue;
+        const double lam1=CLIGHT/f1, lam2=CLIGHT/f2;
+        const double alpha=f1_2/den, beta=f2_2/den;
+        const double C = alpha*lam1 - beta*lam2;
+        if (fabs(C) < 1e-12) continue;
+
+        ddamb[i].DD_NL = (ddamb[i].DD_IF - beta*lam2*ddamb[i].DD_WL_fix) / C;
+        const double k_if = 1.0/C, k_wl = (-beta*lam2)/C;
+        const double var_nl = k_if*k_if*ddamb[i].var_DD_IF;
+        ddamb[i].var_DD_NL = var_nl;
+
+        double std_nl = (var_nl > 0.0) ? sqrt(var_nl) : 1.0;
+        ddamb[i].DD_NL_fix = (double)fix_ambiguity(ddamb[i].DD_NL, std_nl, th_nl, &fixed);
+        ddamb[i].fixed_NL  = fixed;
+        if (!ddamb[i].fixed_NL) continue;
+
+        ddamb[i].DD_IF_fix = C*ddamb[i].DD_NL_fix + beta*lam2*ddamb[i].DD_WL_fix;
+        n_fixed++;
+    }
+    return n_fixed;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Day1 NEQ v9: ALL parameters in ONE matrix, Cholesky solve
+ *
+ * Matrix: [xyz(3) | arcs(≤100) | ALL_clk(n_ep×n_aclk) | ztd(≤50)]
+ * ALL clock systems (GPS+BDS2+BDS3) are in the global matrix.
+ * NO Schur elimination. NO parameter separation. ZERO approximation.
+ *
+ * Cholesky solve: L*L^T decomposition + forward/back substitution
+ *   - O(n^3/6) ≈ 57 seconds for n=8793
+ *   - In-place: no extra n×n allocation (saves 619 MB)
+ *   - Numerically stable for positive-definite matrices
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int sat, arc, day;
+    gtime_t ts, te;
+    double b_float, var_float, b_fix, var_fix;
+    int used;
+} pbp_arcfix_t;
+
+static pbp_arcfix_t *pbp_arcfix   = NULL;
+static int           pbp_n_arcfix = 0;
+static double        pbp_pb_weight = 1.0e10;
+
+int                  pbp_resolve_flag = 0;
+int                  pbp_neq_accum_flag = 0;
+int                  pbp_epoch_collected = 0;
+int                  pbp_current_day = -1;
+gtime_t              pbp_day_start_win[2]={{0}};
+gtime_t              pbp_day_end_win[2]={{0}};
+int                  pbp_epoch_offset[2]={0};
+int                  pbp_ztd_offset[2]={0};
+int                  pbp_day_epoch_n[2]={0};
+int                  pbp_day_ztd_n[2]={0};
+
+#define PBP_MAX_ARC_DAY1   100
+#define PBP_MAX_DD_CONSTR  256
+#define PBP_MAX_CLK_SYS      8
+#define PBP_MAX_ZTD_DAY1    50
+
+typedef struct {
+    int sat, day, arc_id, amb_col;
+    gtime_t ts, te;
+    double xlin_wsum, xlin_wdenom;
+} pbp_arc_col_t;
+
+typedef struct {
+    int sat1, sat2;
+    double bc, weight;
+    int col_ref, col_sat;
+} pbp_ddcon_t;
+
+typedef struct {
+    int n_xyz, n_aclk, n_epoch, n_ztd, n_trop_per_block, n_total;
+    int clk_map[PBP_MAX_CLK_SYS]; /* EKF k → active clock index */
+    int n_arc_used;
+    pbp_arc_col_t arc_cols[PBP_MAX_ARC_DAY1];
+    pbp_ddcon_t ddc[PBP_MAX_DD_CONSTR];
+    int n_ddc;
+
+    double *N;        /* [n_total × n_total] */
+    double *w;        /* [n_total]           */
+    double *clk_lin;  /* [n_epoch * n_aclk]  */
+    double *clk_float;/* [n_epoch * n_aclk]  */
+    int *epoch_valid;   /* 1 = EKF produced a solution at this epoch */
+    int *epoch_has_neq; /* 1 = NEQ data accumulated (converged epoch) */
+    gtime_t *epoch_time;
+
+    int day1_epoch_count;
+    double *day1_fixed_clock;
+    int ready;
+    gtime_t t0, t1; double ti;
+} pbp_neq_t;
+
+static pbp_neq_t g_pbp_neq = {0};
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Diagnostic instrumentation (logging & counters only, NO math changes)
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define PBP_DIAG_MAX_EPOCH 8000
+
+typedef struct {
+    /* Global counters */
+    int add_call_total;
+    int add_ok_total;
+    int fail_bad_input;
+    int fail_epoch_id;
+    int fail_R_invert;
+    int fail_no_active_param;
+    int fail_vrms_too_large;   /* hard reject (nwrms >= T2) */
+    int fail_alloc;
+    int schur_fail_total;        /* always 0 in v9 (no Schur) */
+    int epoch_collision_total;
+    int backsub_ok_count;
+    int backsub_fallback_count;
+    /* Normalized-residual gate statistics */
+    int gate_soft_weight_count;  /* T1 < nwrms < T2: soft downweighted */
+    double nwrms_sum;
+    int    nwrms_count;
+    double nwrms_max;
+    /* Per-epoch arrays */
+    int    epoch_hit_count[PBP_DIAG_MAX_EPOCH];
+    int    epoch_nv_last[PBP_DIAG_MAX_EPOCH];
+    int    epoch_nact_last[PBP_DIAG_MAX_EPOCH];
+    int    epoch_backsub_ok[PBP_DIAG_MAX_EPOCH];
+} pbp_diag_t;
+
+static pbp_diag_t g_pbp_diag = {0};
+
+static void pbp_diag_reset(void)
+{
+    memset(&g_pbp_diag, 0, sizeof(g_pbp_diag));
+}
+
+/* ── Cholesky solve: L*L^T*x = b, in-place ─────────────────────────── */
+static int cholesky_solve(double *A, double *b, int n)
+{
+    int i, j, k;
+    double s;
+    /* L*L^T decomposition (lower triangle stored in A) */
+    for (j = 0; j < n; j++) {
+        s = A[j + j*(size_t)n];
+        for (k = 0; k < j; k++) s -= A[j + k*(size_t)n] * A[j + k*(size_t)n];
+        if (s <= 1e-30) return -1;
+        A[j + j*(size_t)n] = sqrt(s);
+        for (i = j+1; i < n; i++) {
+            s = A[i + j*(size_t)n];
+            for (k = 0; k < j; k++) s -= A[i + k*(size_t)n] * A[j + k*(size_t)n];
+            A[i + j*(size_t)n] = s / A[j + j*(size_t)n];
         }
-        else {
-            strcpy(tracefile,fopt->trace);
-        }
-        traceclose();
-        traceopen(tracefile);
-        tracelevel(sopt->trace);
     }
+    /* Forward: L*y = b */
+    for (i = 0; i < n; i++) {
+        s = b[i];
+        for (k = 0; k < i; k++) s -= A[i + k*(size_t)n] * b[k];
+        b[i] = s / A[i + i*(size_t)n];
+    }
+    /* Backward: L^T*x = y */
+    for (i = n-1; i >= 0; i--) {
+        s = b[i];
+        for (k = i+1; k < n; k++) s -= A[k + i*(size_t)n] * b[k];
+        b[i] = s / A[i + i*(size_t)n];
+    }
+    return 0;
+}
 
-    /* open B2b SSR/OSB trace (independent of main trace level) */
-    if (flag && outfile && *outfile) {
-        int b2b_trlev = sopt->trace;
-        if (b2b_trlev < 22) b2b_trlev = 22;
-        B2b_traceclose();
-        strcpy(B2btracefile,outfile);
-        strcat(B2btracefile,".B2bssr");
-        B2b_tracelevel(b2b_trlev);
-        B2b_traceopen(B2btracefile);
-    }
+static void pbp_neq_free(void)
+{
+    free(g_pbp_neq.N); free(g_pbp_neq.w);
+    free(g_pbp_neq.clk_lin); free(g_pbp_neq.clk_float);
+    free(g_pbp_neq.epoch_valid); free(g_pbp_neq.epoch_has_neq);
+    free(g_pbp_neq.epoch_time); free(g_pbp_neq.day1_fixed_clock);
+    memset(&g_pbp_neq,0,sizeof(g_pbp_neq));
+}
 
-/* read ionosphere data file */
-    if (*fopt->iono&&(ext=strrchr(fopt->iono,'.'))) {
-        if (strlen(ext)==4&&(ext[3]=='i'||ext[3]=='I'||
-                             strcmp(ext,".INX")==0||strcmp(ext,".inx")==0)) {
-            reppath(fopt->iono,path,ts,"","");
-            readtec(path,&navs,1);
+extern void pbp_clear_fixed_constraints(void)
+{
+    pbp_pb_weight=1e10; pbp_neq_free(); pbp_current_day=-1;
+    memset(pbp_day_start_win,0,sizeof(pbp_day_start_win));
+    memset(pbp_day_end_win,0,sizeof(pbp_day_end_win));
+    memset(pbp_epoch_offset,0,sizeof(pbp_epoch_offset));
+    memset(pbp_ztd_offset,0,sizeof(pbp_ztd_offset));
+    memset(pbp_day_epoch_n,0,sizeof(pbp_day_epoch_n));
+    memset(pbp_day_ztd_n,0,sizeof(pbp_day_ztd_n));
+}
+extern int pbp_has_fixed_constraints(void){return g_pbp_neq.ready;}
+
+extern void pbp_set_day_window(int day,gtime_t ts,gtime_t te,double ti)
+{
+    if(day<0||day>1)return;
+    if(ti<=0){
+        fprintf(stderr,"[PBP-DIAG] WARNING: ti=%.1f<=0 in set_day_window(day=%d), "
+                "replacing with 30.0s\n",ti,day);
+        ti=30.0;
+    }
+    pbp_current_day=day;
+    pbp_day_start_win[day]=ts; pbp_day_end_win[day]=te;
+    pbp_day_epoch_n[day]=(int)floor(timediff(te,ts)/ti+0.5)+1;
+    pbp_day_ztd_n[day]=(int)floor(timediff(te,ts)/3600.0+1.0)+1;
+    if(day==0){pbp_epoch_offset[0]=0;pbp_ztd_offset[0]=0;}
+    else{pbp_epoch_offset[1]=pbp_day_epoch_n[0];pbp_ztd_offset[1]=pbp_day_ztd_n[0];}
+    fprintf(stderr,"[PBP-DIAG] set_day_window: day=%d ti=%.1fs n_epoch=%d "
+            "ep_offset=%d ztd_offset=%d\n",
+            day,ti,pbp_day_epoch_n[day],pbp_epoch_offset[day],pbp_ztd_offset[day]);
+}
+
+extern int pbp_neq_init(gtime_t t0,gtime_t t1,double ti,const prcopt_t *opt)
+{
+    int nc,k;
+    pbp_neq_free();
+    pbp_diag_reset();
+    if(!opt||timediff(t1,t0)<0)return 0;
+    if(ti<=0){
+        fprintf(stderr,"[PBP-DIAG] WARNING: ti=%.1f<=0 in pbp_neq_init, "
+                "replacing with 30.0s\n",ti);
+        ti=30.0;
+    }
+    g_pbp_neq.t0=t0; g_pbp_neq.t1=t1; g_pbp_neq.ti=ti;
+    g_pbp_neq.n_xyz=3;
+    g_pbp_neq.n_epoch=(int)floor(timediff(t1,t0)/ti+0.5)+1;
+    g_pbp_neq.n_ztd=(int)floor(timediff(t1,t0)/3600.0+1.0)+1;
+    if(g_pbp_neq.n_ztd>PBP_MAX_ZTD_DAY1)g_pbp_neq.n_ztd=PBP_MAX_ZTD_DAY1;
+
+    /* Map ALL nc clock systems including BDS3 */
+    nc=pbp_NC(opt);
+    g_pbp_neq.n_aclk=0;
+    for(k=0;k<PBP_MAX_CLK_SYS;k++)g_pbp_neq.clk_map[k]=-1;
+    for(k=0;k<nc&&k<PBP_MAX_CLK_SYS;k++){
+        int sys;
+        switch(k){
+            case 0:sys=SYS_GPS;break;case 1:sys=SYS_GLO;break;
+            case 2:sys=SYS_GAL;break;case 3:sys=SYS_CMP;break;
+            case 4:sys=SYS_IRN;break;default:sys=SYS_CMP;break;
+        }
+        if(opt->navsys&sys) g_pbp_neq.clk_map[k]=g_pbp_neq.n_aclk++;
+    }
+    if(g_pbp_neq.n_aclk<=0)return 0;
+
+    /* Troposphere: 1 param (ZTD only) for EST, 3 params (ZTD+GN+GE) for ESTG */
+    g_pbp_neq.n_trop_per_block = pbp_NT(opt); /* 0, 1, or 3 */
+    if(g_pbp_neq.n_trop_per_block<0) g_pbp_neq.n_trop_per_block=0;
+
+    int ne=g_pbp_neq.n_epoch, na=g_pbp_neq.n_aclk;
+    int ntrop_total = g_pbp_neq.n_ztd * g_pbp_neq.n_trop_per_block;
+    g_pbp_neq.n_total=3+PBP_MAX_ARC_DAY1+ne*na+ntrop_total;
+    int nt=g_pbp_neq.n_total;
+
+    g_pbp_neq.N        =(double*)calloc((size_t)nt*nt,sizeof(double));
+    g_pbp_neq.w        =(double*)calloc(nt,sizeof(double));
+    g_pbp_neq.clk_lin  =(double*)calloc((size_t)ne*na,sizeof(double));
+    g_pbp_neq.clk_float=(double*)calloc((size_t)ne*na,sizeof(double));
+    g_pbp_neq.epoch_valid=(int*)calloc(ne,sizeof(int));
+    g_pbp_neq.epoch_has_neq=(int*)calloc(ne,sizeof(int));
+    g_pbp_neq.epoch_time=(gtime_t*)calloc(ne,sizeof(gtime_t));
+    g_pbp_neq.day1_fixed_clock=(double*)calloc(ne,sizeof(double));
+    if(!g_pbp_neq.N||!g_pbp_neq.w||!g_pbp_neq.clk_lin||!g_pbp_neq.clk_float||
+       !g_pbp_neq.epoch_valid||!g_pbp_neq.epoch_has_neq||
+       !g_pbp_neq.epoch_time||!g_pbp_neq.day1_fixed_clock){
+        pbp_neq_free();return 0;
+    }
+    for(k=0;k<ne;k++) g_pbp_neq.epoch_time[k]=timeadd(t0,k*ti);
+    fprintf(stderr,"[PBP-NEQ] init: ep=%d aclk=%d trop=%dx%d nt=%d (%.0f MB) Cholesky~%.0fs\n",
+            ne,na,g_pbp_neq.n_ztd,g_pbp_neq.n_trop_per_block,
+            nt,(double)nt*nt*8/1e6,(double)nt*nt*(double)nt/6.0/2e9);
+    fprintf(stderr,"[PBP-DIAG] init: ti=%.1fs n_epoch=%d day_offsets=[%d,%d] "
+            "ztd_offsets=[%d,%d]\n",
+            ti,ne,pbp_epoch_offset[0],pbp_epoch_offset[1],
+            pbp_ztd_offset[0],pbp_ztd_offset[1]);
+    return 1;
+}
+
+/* ── Column helpers ────────────────────────────────────────────────────── */
+static int pbp_epoch_id_day1(gtime_t t){
+    int e=(int)floor(timediff(t,g_pbp_neq.t0)/g_pbp_neq.ti+0.5);
+    if(e<0)e=0;if(e>=g_pbp_neq.n_epoch)e=g_pbp_neq.n_epoch-1;return e;
+}
+static int pbp_clk_col(int epoch,int ekf_k){
+    int a=g_pbp_neq.clk_map[ekf_k]; if(a<0)return -1;
+    return g_pbp_neq.n_xyz+PBP_MAX_ARC_DAY1+epoch*g_pbp_neq.n_aclk+a;
+}
+/* Troposphere column: trop_idx=0→ZTD, 1→GN, 2→GE within each hour block */
+static int pbp_trop_col(gtime_t t, int trop_idx){
+    int ntpb=g_pbp_neq.n_trop_per_block;
+    if(ntpb<=0||trop_idx<0||trop_idx>=ntpb)return -1;
+    int h=(int)floor(timediff(t,g_pbp_neq.t0)/3600.0);
+    if(h<0)h=0;if(h>=g_pbp_neq.n_ztd)h=g_pbp_neq.n_ztd-1;
+    return g_pbp_neq.n_xyz+PBP_MAX_ARC_DAY1+g_pbp_neq.n_epoch*g_pbp_neq.n_aclk
+           +h*ntpb+trop_idx;
+}
+
+/* ── Arc column ────────────────────────────────────────────────────────── */
+static int pbp_get_arc_col_day1(int sat,gtime_t t){
+    int arc_id,k;
+    if(sat<=0||sat>MAXSAT||satamb[sat-1].n<=0)return -1;
+    arc_id=-1;
+    for(k=0;k<satamb[sat-1].n;k++){
+        const ambarc_t *a=&satamb[sat-1].arc[k];
+        if(a->day!=1)continue;
+        if(timediff(t,a->ts)<-DTTOL||timediff(t,a->te)>PBP_EPOCH_GAP_SEC+DTTOL)continue;
+        arc_id=k;break;
+    }
+    if(arc_id<0)return -1;
+    for(k=0;k<g_pbp_neq.n_arc_used;k++)
+        if(g_pbp_neq.arc_cols[k].sat==sat&&g_pbp_neq.arc_cols[k].arc_id==arc_id)
+            return g_pbp_neq.arc_cols[k].amb_col;
+    if(g_pbp_neq.n_arc_used>=PBP_MAX_ARC_DAY1)return -1;
+    k=g_pbp_neq.n_arc_used;
+    g_pbp_neq.arc_cols[k].sat=sat;g_pbp_neq.arc_cols[k].day=1;
+    g_pbp_neq.arc_cols[k].arc_id=arc_id;
+    g_pbp_neq.arc_cols[k].ts=satamb[sat-1].arc[arc_id].ts;
+    g_pbp_neq.arc_cols[k].te=satamb[sat-1].arc[arc_id].te;
+    g_pbp_neq.arc_cols[k].amb_col=g_pbp_neq.n_xyz+k;
+    g_pbp_neq.arc_cols[k].xlin_wsum=0;g_pbp_neq.arc_cols[k].xlin_wdenom=0;
+    g_pbp_neq.n_arc_used++;
+    return g_pbp_neq.arc_cols[k].amb_col;
+}
+static int pbp_find_arc_col_day1(int sat,int arc_id){
+    int k;
+    for(k=0;k<g_pbp_neq.n_arc_used;k++)
+        if(g_pbp_neq.arc_cols[k].sat==sat&&g_pbp_neq.arc_cols[k].arc_id==arc_id)
+            return g_pbp_neq.arc_cols[k].amb_col;
+    return -1;
+}
+extern int pbp_build_arc_columns(void){
+    int sat,j,k,added=0;
+    for(sat=1;sat<=MAXSAT;sat++)
+        for(j=0;j<satamb[sat-1].n;j++){
+            const ambarc_t *a=&satamb[sat-1].arc[j];
+            if(a->day!=1||a->nobs<10)continue;
+            if(pbp_find_arc_col_day1(sat,j)>=0)continue;
+            if(g_pbp_neq.n_arc_used>=PBP_MAX_ARC_DAY1)continue;
+            k=g_pbp_neq.n_arc_used;
+            g_pbp_neq.arc_cols[k].sat=sat;g_pbp_neq.arc_cols[k].day=1;
+            g_pbp_neq.arc_cols[k].arc_id=j;g_pbp_neq.arc_cols[k].ts=a->ts;
+            g_pbp_neq.arc_cols[k].te=a->te;g_pbp_neq.arc_cols[k].amb_col=g_pbp_neq.n_xyz+k;
+            g_pbp_neq.arc_cols[k].xlin_wsum=0;g_pbp_neq.arc_cols[k].xlin_wdenom=0;
+            g_pbp_neq.n_arc_used++;added++;
+        }
+    fprintf(stderr,"[PBP-NEQ] arcs: %d\n",g_pbp_neq.n_arc_used);
+    return g_pbp_neq.n_arc_used>0;
+}
+
+static double pbp_htrh(const double *H,const double *Ri,int a,int b,int nx,int nv){
+    double s=0;int k,l;
+    for(k=0;k<nv;k++){double r=0;for(l=0;l<nv;l++)r+=Ri[k+l*nv]*H[b+l*nx];s+=H[a+k*nx]*r;}
+    return s;
+}
+
+/*===========================================================================
+ * pbp_neq_add_epoch — ALL params in one global matrix, no quality gate.
+ *
+ * CRITICAL ordering:
+ *   1. Compute epoch index, save epoch_time
+ *   2. Save clk_lin / clk_float / epoch_valid  (BEFORE gate!)
+ *   3. Gate: soft downweight only (no hard reject in stage 1)
+ *   4. Build gmap, accumulate N/w
+ *=========================================================================*/
+extern int pbp_neq_add_epoch(rtk_t *rtk,const obsd_t *obs,int n,
+                              const double *v,const double *H,
+                              const double *R,int nv,const double *x_lin)
+{
+    const prcopt_t *opt;
+    double *Ri=NULL;
+    int *gmap=NULL;
+    int e,nc,nt,i,k;
+
+    g_pbp_diag.add_call_total++;
+
+    if(!rtk||!obs||n<=0||!v||!H||!R||nv<=0||!x_lin){
+        g_pbp_diag.fail_bad_input++; return 0;
+    }
+    if(!pbp_neq_accum_flag||!g_pbp_neq.N){
+        g_pbp_diag.fail_bad_input++; return 0;
+    }
+    opt=&rtk->opt; nc=pbp_NC(opt);
+    nt=g_pbp_neq.n_total;
+
+    /* ── Step 1: epoch index and epoch_time ─────────────────────────── */
+    e=pbp_epoch_id_day1(obs[0].time);
+    if(e<0||e>=g_pbp_neq.n_epoch){
+        g_pbp_diag.fail_epoch_id++; return 0;
+    }
+    g_pbp_neq.epoch_time[e]=obs[0].time;
+
+    /* ── Step 2: ALWAYS save clk_lin/clk_float/epoch_valid ──────────
+     * These MUST be saved even if the gate later downweights heavily.
+     * Without clk_lin[e], the backsub step has no linearization point
+     * and falls back to zero → backsub_fallback_ratio ≈ 100%.
+     * Without epoch_valid[e]=1, the epoch is excluded from output. */
+    {
+        int na=g_pbp_neq.n_aclk;
+        for(k=0;k<nc&&k<PBP_MAX_CLK_SYS;k++){
+            int a=g_pbp_neq.clk_map[k]; if(a<0)continue;
+            int ic=pbp_NP(opt)+k;
+            if(ic<rtk->nx){
+                g_pbp_neq.clk_lin[e*na+a]=x_lin[ic];
+                g_pbp_neq.clk_float[e*na+a]=rtk->x[ic];
+            }
         }
     }
-    /* read erp data */
-    if (*fopt->eop) {
-        free(navs.erp.data); navs.erp.data=NULL; navs.erp.n=navs.erp.nmax=0;
-        reppath(fopt->eop,path,ts,"","");
-        if (!readerp(path,&navs.erp)) {
-            showmsg("error : no erp data %s",path);
-            trace(2,"no erp data %s\n",path);
-        }
-    }
-    /* read obs and nav data */
-    if (!readobsnav(ts,te,ti,infile,index,n,&popt_,&obss,&navs,stas)) {
-        /* free obs and nav data */
-        freeobsnav(&obss, &navs);
-        free(rtk_ptr);
-        return 0;
-    }
+    g_pbp_neq.epoch_valid[e]=1;
 
-    /* read dcb parameters from DCB, BIA, BSX files */
-    dcb_ok = 0;
-    for (i=0;i<MAX_CODE_BIASES;i++) for (k=0;k<MAX_CODE_BIAS_FREQS;k++) {
-        /* FIXME: cbias later initialized with 0 in readdcb()!  */
-        for (j=0;j<MAXSAT;j++) navs.cbias[j][k][i]=-1;
-        for (j=0;j<MAXRCV;j++) navs.rbias[j][k][i]=0;
-        }
-    for (i=0;i<n;i++) {  /* first check infiles for .BIA or .BSX files */
-        if ((dcb_ok=readdcb(infile[i],&navs,stas))) break;
-    }
-    if (!dcb_ok&&*fopt->dcb) {  /* then check if DCB file specified */
-        reppath(fopt->dcb,path,ts,"","");
-        dcb_ok=readdcb(path,&navs,stas);
-    }
-    if (!dcb_ok) {
-
-    }
-    /* set antenna parameters */
-    if (popt_.mode!=PMODE_SINGLE) {
-        setpcv(obss.n>0?obss.data[0].time:timeget(),&popt_,&navs,&pcvss,&pcvsr,
-               stas);
-    }
-    /* read ocean tide loading parameters */
-    if (popt_.mode>PMODE_SINGLE&&*fopt->blq) {
-        readotl(&popt_,fopt->blq,stas);
-    }
-    /* rover/reference fixed position */
-    if (popt_.mode==PMODE_FIXED) {
-        if (!antpos(&popt_,1,&obss,&navs,stas,fopt->stapos)) {
-            freeobsnav(&obss,&navs);
-            free(rtk_ptr);
+    /* ── Step 3: Convergence check ────────────────────────────────────
+     * During early EKF convergence (first ~10min), x_predicted has large
+     * position errors (~km) → v_omc = y - h(x_predicted) has RMS >> 50m.
+     * After convergence, position is correct; v_omc RMS is ~1-5m (dominated
+     * by clock prediction error, which is normal for the NEQ).
+     *
+     * Unconverged epochs: skip NEQ accumulation, output clk_float directly.
+     * This avoids injecting huge v_omc into the law equations while still
+     * producing a complete clock series (float values for early epochs,
+     * fixed values for converged epochs). */
+    {
+        double vrms=0;
+        for(k=0;k<nv;k++) vrms+=v[k]*v[k];
+        vrms=sqrt(vrms/(nv>0?nv:1));
+        if(vrms>=50.0){
+            /* Unconverged: epoch_valid=1 but epoch_has_neq=0 → output float */
+            g_pbp_diag.fail_vrms_too_large++;
             return 0;
         }
-        if (!antpos(&popt_,2,&obss,&navs,stas,fopt->stapos)) {
-            freeobsnav(&obss,&navs);
-            free(rtk_ptr);
-            return 0;
-        }
     }
-    else if (PMODE_DGPS<=popt_.mode&&popt_.mode<=PMODE_STATIC_START) {
-        if (!antpos(&popt_,2,&obss,&navs,stas,fopt->stapos)) {
-            freeobsnav(&obss,&navs);
-            free(rtk_ptr);
-            return 0;
-        }
-    }
-    /* open solution statistics */
-    if (flag&&sopt->sstat>0) {
-        strcpy(statfile,outfile);
-        strcat(statfile,".stat");
-        rtkclosestat();
-        rtkopenstat(statfile,sopt->sstat);
-    }
-    /* write header to output file */
-    if (flag&&!outhead(outfile,infile,n,&popt_,sopt)) {
-        freeobsnav(&obss,&navs);
-        free(rtk_ptr);
-        return 0;
-    }
-    /* name time events file */
-    namefiletm(outfiletm,outfile);
-    /* write header to file with time marks */
-    outhead(outfiletm,infile,n,&popt_,sopt);
+    g_pbp_neq.epoch_has_neq[e]=1;
 
-    iobsu=iobsr=isbs=reverse=aborts=0;
+    /* ── Step 4: Invert R and accumulate N/w ─────────────────────────── */
+    Ri=mat(nv,nv);if(!Ri){g_pbp_diag.fail_alloc++;return 0;}
+    matcpy(Ri,R,nv,nv);
+    if(matinv(Ri,nv)){free(Ri);g_pbp_diag.fail_R_invert++;return 0;}
 
-    if (popt_.mode==PMODE_SINGLE||popt_.soltype==SOLTYPE_FORWARD) {
-        FILE *fp=openfile(outfile);
-        if (fp) {
-            FILE *fptm=openfile(outfiletm);
-            if (fptm) {
-                rtkinit(rtk_ptr,&popt_);
-                procpos(fp,fptm,&popt_,sopt,rtk_ptr,SOLMODE_SINGLE_DIR);
+    /* ── Step 4: Build gmap and accumulate N/w ─────────────────────── */
+    gmap=(int*)malloc(sizeof(int)*rtk->nx);
+    if(!gmap){free(Ri);g_pbp_diag.fail_alloc++;return 0;}
+    for(i=0;i<rtk->nx;i++) gmap[i]=-1;
 
-                rtkfree(rtk_ptr);
-                fclose(fptm);
-            }
-            fclose(fp);
-        }
+    gmap[0]=0;gmap[1]=1;gmap[2]=2; /* XYZ */
+
+    /* ALL clock systems → global columns */
+    for(k=0;k<nc&&k<PBP_MAX_CLK_SYS;k++){
+        if(g_pbp_neq.clk_map[k]<0)continue;
+        int ic=pbp_NP(opt)+k;
+        if(ic>=rtk->nx)continue;
+        int has=0;
+        for(i=0;i<nv;i++)if(fabs(H[ic+i*rtk->nx])>1e-30){has=1;break;}
+        if(has) gmap[ic]=pbp_clk_col(e,k);
     }
-    else if (popt_.soltype==SOLTYPE_BACKWARD) {
-        FILE *fp=openfile(outfile);
-        if (fp) {
-            FILE *fptm=openfile(outfiletm);
-            if (fptm) {
-                reverse=1; iobsu=iobsr=obss.n-1; isbs=sbss.n-1;
-                rtkinit(rtk_ptr,&popt_);
-                procpos(fp,fptm,&popt_,sopt,rtk_ptr,SOLMODE_SINGLE_DIR);
-                rtkfree(rtk_ptr);
-                fclose(fptm);
-            }
-            fclose(fp);
-        }
-    }
-    else { /* combined or combined with no phase reset */
-        solf=(sol_t *)malloc(sizeof(sol_t)*nepoch);
-        solb=(sol_t *)malloc(sizeof(sol_t)*nepoch);
-        rbf=(double *)malloc(sizeof(double)*nepoch*3);
-        rbb=(double *)malloc(sizeof(double)*nepoch*3);
 
-        if (solf&&solb) {
-            isolf=isolb=0;
-            rtkinit(rtk_ptr,&popt_);
-            procpos(NULL,NULL,&popt_,sopt,rtk_ptr,SOLMODE_COMBINED); /* forward */
-            reverse=1; iobsu=iobsr=obss.n-1; isbs=sbss.n-1;
-            if (popt_.soltype!=SOLTYPE_COMBINED_NORESET) {
-                /* Reset */
-                rtkfree(rtk_ptr);
-                rtkinit(rtk_ptr,&popt_);
-            }
-            procpos(NULL,NULL,&popt_,sopt,rtk_ptr,SOLMODE_COMBINED); /* backward */
-            rtkfree(rtk_ptr);
-
-            /* combine forward/backward solutions */
-            if (!aborts) {
-                FILE *fp=openfile(outfile);
-                if (fp) {
-                    FILE *fptm=openfile(outfiletm);
-                    if (fptm) {
-                        combres(fp,fptm,&popt_,sopt);
-                        fclose(fptm);
-                    }
-                    fclose(fp);
-                }
+    /* Troposphere: map all NT params (ZTD, and GN/GE if ESTG) */
+    {
+        int nt_trop=pbp_NT(opt);
+        for(int t_idx=0;t_idx<nt_trop;t_idx++){
+            int ekf_idx=pbp_NP(opt)+pbp_NC(opt)+t_idx;
+            if(ekf_idx<rtk->nx){
+                int col=pbp_trop_col(obs[0].time,t_idx);
+                if(col>=0) gmap[ekf_idx]=col;
             }
         }
-        else showmsg("error : memory allocation");
-        free(solf);
-        free(solb);
-        free(rbf);
-        free(rbb);
     }
-    /* free rtk, obs and nav data */
-    free(rtk_ptr);
-    freeobsnav(&obss,&navs);
 
-    return aborts?1:0;
+    /* Day1 arcs */
+    for(i=0;i<n&&i<MAXOBS;i++){
+        int sat=obs[i].sat,ib=pbp_IB(sat,0,opt);
+        if(ib<0||ib>=rtk->nx)continue;
+        int ok=0;
+        for(k=0;k<nv;k++)if(fabs(H[ib+k*rtk->nx])>1e-30){ok=1;break;}
+        if(!ok)continue;
+        int col=pbp_get_arc_col_day1(sat,obs[i].time);
+        if(col>=0) gmap[ib]=col;
+    }
+
+    /* Collect active params */
+    int nact=0;
+    int act_x[600],act_g[600];
+    for(i=0;i<rtk->nx;i++)
+        if(gmap[i]>=0&&nact<600){act_x[nact]=i;act_g[nact]=gmap[i];nact++;}
+
+    if(nact<=0){
+        free(Ri);free(gmap);
+        g_pbp_diag.fail_no_active_param++;return 0;
+    }
+
+    /* Ri*v */
+    double *Riv=mat(nv,1);
+    if(!Riv){free(Ri);free(gmap);g_pbp_diag.fail_alloc++;return 0;}
+    for(k=0;k<nv;k++){double s=0;for(i=0;i<nv;i++)s+=Ri[k+i*nv]*v[i];Riv[k]=s;}
+
+    /* Direct accumulation: N += H^T Ri H,  w += H^T Ri v */
+    for(i=0;i<nact;i++){
+        int a=act_x[i],gi=act_g[i];
+        double wa=0;
+        for(k=0;k<nv;k++) wa+=H[a+k*rtk->nx]*Riv[k];
+        g_pbp_neq.w[gi]+=wa;
+        for(int j=0;j<nact;j++){
+            int b=act_x[j],gj=act_g[j];
+            g_pbp_neq.N[gi+(size_t)gj*nt]+=pbp_htrh(H,Ri,a,b,rtk->nx,nv);
+        }
+        /* Track xlin for arcs */
+        if(gi>=g_pbp_neq.n_xyz && gi<g_pbp_neq.n_xyz+PBP_MAX_ARC_DAY1){
+            int ai=gi-g_pbp_neq.n_xyz;
+            double Nab=pbp_htrh(H,Ri,a,a,rtk->nx,nv);
+            g_pbp_neq.arc_cols[ai].xlin_wsum+=Nab*x_lin[a];
+            g_pbp_neq.arc_cols[ai].xlin_wdenom+=Nab;
+        }
+    }
+
+    free(Riv);free(Ri);free(gmap);
+
+    /* Diag: record per-epoch stats */
+    if(e>=0 && e<PBP_DIAG_MAX_EPOCH){
+        g_pbp_diag.epoch_hit_count[e]++;
+        if(g_pbp_diag.epoch_hit_count[e]>1)
+            g_pbp_diag.epoch_collision_total++;
+        g_pbp_diag.epoch_nv_last[e]=nv;
+        g_pbp_diag.epoch_nact_last[e]=nact;
+    }
+    g_pbp_diag.add_ok_total++;
+    return 1;
 }
-/* execute processing session for each rover ---------------------------------*/
-static int execses_r(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
-                     const solopt_t *sopt, const filopt_t *fopt, int flag,
-                     const char **infile, const int *index, int n, const char *outfile,
-                     const char *rov)
+
+/*===========================================================================
+ * pbp_store_fixed_constraints
+ *=========================================================================*/
+extern int pbp_store_fixed_constraints(const ddamb_t *dd,int n_dd,double Pb)
 {
-    gtime_t t0={0};
-    int i,stat=0;
-    char *ifile[MAXINFILE],ofile[1024],*rov_,*q,s[40]="";
-    const char *p;
+    int i,r0,r1,s0,s1,ref,sat,col_ref,col_sat;
+    double bc;
+    pbp_pb_weight=Pb>0?Pb:1e10;
+    if(!dd||n_dd<=0)return 0;
+    if(!pbp_build_arc_columns())return 0;
+    g_pbp_neq.n_ddc=0;
+    for(i=0;i<n_dd&&g_pbp_neq.n_ddc<PBP_MAX_DD_CONSTR;i++){
+        if(!dd[i].fixed_WL||!dd[i].fixed_NL)continue;
+        ref=dd[i].sat1;sat=dd[i].sat2;
+        r0=-1;r1=-1;s0=-1;s1=-1;
+        if(!select_best_arc_pair(satamb,ref,&r0,&r1))continue;
+        if(!select_best_arc_pair(satamb,sat,&s0,&s1))continue;
+        col_ref=pbp_find_arc_col_day1(ref,r1);
+        col_sat=pbp_find_arc_col_day1(sat,s1);
+        if(col_ref<0||col_sat<0)continue;
+        {int ai_r=col_ref-g_pbp_neq.n_xyz,ai_s=col_sat-g_pbp_neq.n_xyz;
+         if(ai_r<0||ai_s<0)continue;
+         if(g_pbp_neq.arc_cols[ai_r].xlin_wdenom<=0||
+            g_pbp_neq.arc_cols[ai_s].xlin_wdenom<=0)continue;}
 
-    trace(3,"execses_r: n=%d outfile=%s\n",n,outfile);
+        bc = -(dd[i].DD_IF_fix - dd[i].DD_IF);
 
-    for (i=0;i<n;i++) if (strstr(infile[i],"%r")) break;
-
-    if (i<n) { /* include rover keywords */
-        if (!(rov_=(char *)malloc(strlen(rov)+1))) return 0;
-        strcpy(rov_,rov);
-
-        for (i=0;i<n;i++) {
-            if (!(ifile[i]=(char *)malloc(1024))) {
-                free(rov_); for (;i>=0;i--) free(ifile[i]);
-                return 0;
-            }
-        }
-        for (p=rov_;;p=q+1) { /* for each rover */
-            if ((q=strchr(p,' '))) *q='\0';
-
-            if (*p) {
-                strcpy(proc_rov,p);
-                if (ts.time) time2str(ts,s,0); else *s='\0';
-                if (checkbrk("reading    : %s",s)) {
-                    stat=1;
-                    break;
-                }
-                for (i=0;i<n;i++) reppath(infile[i],ifile[i],t0,p,"");
-                reppath(outfile,ofile,t0,p,"");
-
-                /* execute processing session */
-                stat=execses(ts,te,ti,popt,sopt,fopt,flag,(const char **)ifile,index,n,ofile);
-            }
-            if (stat==1||!q) break;
-        }
-        free(rov_); for (i=0;i<n;i++) free(ifile[i]);
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat1=ref;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat2=sat;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].bc=bc;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].weight=pbp_pb_weight;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].col_ref=col_ref;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].col_sat=col_sat;
+        g_pbp_neq.n_ddc++;
     }
-    else {
-        /* execute processing session */
-        stat=execses(ts,te,ti,popt,sopt,fopt,flag,infile,index,n,outfile);
-    }
-    return stat;
+    fprintf(stderr,"[PBP-NEQ] DD: %d\n",g_pbp_neq.n_ddc);
+    return g_pbp_neq.n_ddc;
 }
-/* execute processing session for each base station --------------------------*/
-static int execses_b(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
-                     const solopt_t *sopt, const filopt_t *fopt, int flag,
-                     const char **infile, const int *index, int n, const char *outfile,
-                     const char *rov, const char *base)
+
+/*===========================================================================
+ * pbp_finalize_final_neq — constrain, inject DD, compress, Cholesky solve
+ *=========================================================================*/
+extern int pbp_finalize_final_neq(void)
 {
-    gtime_t t0={0};
-    int i,stat=0;
-    char *ifile[MAXINFILE],ofile[1024],*base_,*q,s[40];
-    const char *p;
+    int nt=g_pbp_neq.n_total,ne=g_pbp_neq.n_epoch,na=g_pbp_neq.n_aclk,i,j;
+    if(!g_pbp_neq.N||!g_pbp_neq.w)return 0;
 
-    trace(3,"execses_b: n=%d outfile=%s\n",n,outfile);
-
-    /* read prec ephemeris and sbas data */
-    readpreceph(infile,n,popt,&navs,&sbss);
-
-    for (i=0;i<n;i++) if (strstr(infile[i],"%b")) break;
-
-    if (i<n) { /* include base station keywords */
-        if (!(base_=(char *)malloc(strlen(base)+1))) {
-            freepreceph(&navs,&sbss);
-            return 0;
-        }
-        strcpy(base_,base);
-
-        for (i=0;i<n;i++) {
-            if (!(ifile[i]=(char *)malloc(1024))) {
-                free(base_); for (;i>=0;i--) free(ifile[i]);
-                freepreceph(&navs,&sbss);
-                return 0;
-            }
-        }
-        for (p=base_;;p=q+1) { /* for each base station */
-            if ((q=strchr(p,' '))) *q='\0';
-
-            if (*p) {
-                strcpy(proc_base,p);
-                if (ts.time) time2str(ts,s,0); else *s='\0';
-                if (checkbrk("reading    : %s",s)) {
-                    stat=1;
-                    break;
+    /* 0. Constrain XYZ and ZTD */
+    {
+        double wt_xyz=1.0/(0.001*0.001);
+        for(i=0;i<3;i++) g_pbp_neq.N[i+(size_t)i*nt]+=wt_xyz;
+        /* Trop constraint: all params per hour block (ZTD σ=3mm, gradients σ=1mm) */
+        {
+            int ntpb=g_pbp_neq.n_trop_per_block;
+            int trop_base=g_pbp_neq.n_xyz+PBP_MAX_ARC_DAY1+ne*na;
+            for(i=0;i<g_pbp_neq.n_ztd;i++){
+                for(int t_idx=0;t_idx<ntpb;t_idx++){
+                    int col=trop_base+i*ntpb+t_idx;
+                    if(col<nt&&fabs(g_pbp_neq.N[col+(size_t)col*nt])>1e-25){
+                        double sigma=(t_idx==0)?0.003:0.001; /* ZTD=3mm, grad=1mm */
+                        g_pbp_neq.N[col+(size_t)col*nt]+=1.0/(sigma*sigma);
+                    }
                 }
-                for (i=0;i<n;i++) reppath(infile[i],ifile[i],t0,"",p);
-                reppath(outfile,ofile,t0,"",p);
-
-                stat=execses_r(ts,te,ti,popt,sopt,fopt,flag,(const char **)ifile,index,n,(const char *)ofile,rov);
             }
-            if (stat==1||!q) break;
         }
-        free(base_); for (i=0;i<n;i++) free(ifile[i]);
     }
-    else {
-        stat=execses_r(ts,te,ti,popt,sopt,fopt,flag,infile,index,n,outfile,rov);
-    }
-    /* free prec ephemeris and sbas data */
-    freepreceph(&navs,&sbss);
 
-    return stat;
+    /* 1. Inject DD */
+    int dd_ok=0;
+    for(i=0;i<g_pbp_neq.n_ddc;i++){
+        int cr=g_pbp_neq.ddc[i].col_ref,cs=g_pbp_neq.ddc[i].col_sat;
+        double bc=g_pbp_neq.ddc[i].bc,wt=g_pbp_neq.ddc[i].weight;
+        if(cr<0||cr>=nt||cs<0||cs>=nt)continue;
+        g_pbp_neq.N[cr+(size_t)cr*nt]+=wt;g_pbp_neq.N[cs+(size_t)cs*nt]+=wt;
+        g_pbp_neq.N[cr+(size_t)cs*nt]-=wt;g_pbp_neq.N[cs+(size_t)cr*nt]-=wt;
+        g_pbp_neq.w[cr]+=wt*bc;g_pbp_neq.w[cs]-=wt*bc;
+        dd_ok++;
+    }
+
+    /* 2. Compress */
+    int *cmap=(int*)calloc(nt,sizeof(int));
+    if(!cmap)return 0;
+    for(i=0;i<nt;i++)cmap[i]=-1;
+    int ncomp=0;
+    for(i=0;i<nt;i++)if(fabs(g_pbp_neq.N[i+(size_t)i*nt])>1e-25)cmap[i]=ncomp++;
+    fprintf(stderr,"[PBP-NEQ] compress: %d→%d DD=%d\n",nt,ncomp,dd_ok);
+    if(ncomp<=0){free(cmap);return 0;}
+
+    double *Nc=(double*)calloc((size_t)ncomp*ncomp,sizeof(double));
+    double *wc=(double*)calloc(ncomp,sizeof(double));
+    if(!Nc||!wc){free(cmap);free(Nc);free(wc);return 0;}
+    for(i=0;i<nt;i++){int ci=cmap[i];if(ci<0)continue;
+        wc[ci]=g_pbp_neq.w[i];
+        for(j=0;j<nt;j++){int cj=cmap[j];if(cj<0)continue;
+            Nc[ci+(size_t)cj*ncomp]=g_pbp_neq.N[i+(size_t)j*nt];}
+    }
+    free(g_pbp_neq.N);g_pbp_neq.N=NULL;
+    free(g_pbp_neq.w);g_pbp_neq.w=NULL;
+
+    /* 3. Cholesky solve: overwrites Nc, solution in wc */
+    fprintf(stderr,"[PBP-NEQ] Cholesky %d×%d (%.0f MB)...\n",
+            ncomp,ncomp,(double)ncomp*ncomp*8/1e6);
+    if(cholesky_solve(Nc,wc,ncomp)){
+        fprintf(stderr,"[PBP-NEQ] Cholesky failed, trying matinv...\n");
+        /* Fallback: rebuild Nc from scratch is not possible since N is freed.
+         * This should not happen for a well-conditioned NEQ. */
+        free(cmap);free(Nc);free(wc);return 0;
+    }
+    free(Nc); /* wc now contains the solution */
+
+    /* Expand to full indexing */
+    double *xhat=zeros(nt,1);
+    if(!xhat){free(cmap);free(wc);return 0;}
+    for(i=0;i<nt;i++){int ci=cmap[i];if(ci>=0) xhat[i]=wc[ci];}
+    free(wc);free(cmap);
+
+    /* 4. Extract GPS clock: three tiers
+     *    epoch_has_neq=1 : use NEQ fixed solution (clk_lin + dx)
+     *    epoch_valid=1 but no NEQ : output EKF float directly (clk_float)
+     *    neither : no output (epoch_valid stays 0) */
+    int gps_a=g_pbp_neq.clk_map[0];
+    g_pbp_neq.day1_epoch_count=ne;
+    {
+        int n_fixed=0, n_float_fb=0, n_none=0;
+        double sum_off=0; int cnt_off=0;
+
+        /* Pass 1: compute fixed clocks and datum offset */
+        for(i=0;i<ne;i++){
+            if(g_pbp_neq.epoch_has_neq && g_pbp_neq.epoch_has_neq[i]){
+                int col=g_pbp_neq.n_xyz+PBP_MAX_ARC_DAY1+i*na+gps_a;
+                double dx=(col>=0&&col<nt)?xhat[col]:0.0;
+                double fixed=g_pbp_neq.clk_lin[i*na+gps_a]+dx;
+                double flt=g_pbp_neq.clk_float[i*na+gps_a];
+                g_pbp_neq.day1_fixed_clock[i]=fixed;
+                sum_off+=(fixed-flt); cnt_off++;
+                n_fixed++;
+                g_pbp_diag.backsub_ok_count++;
+                if(i<PBP_DIAG_MAX_EPOCH) g_pbp_diag.epoch_backsub_ok[i]=1;
+            } else if(g_pbp_neq.epoch_valid[i]){
+                /* Unconverged epoch: output float clock directly */
+                g_pbp_neq.day1_fixed_clock[i]=g_pbp_neq.clk_float[i*na+gps_a];
+                n_float_fb++;
+                g_pbp_diag.backsub_fallback_count++;
+                if(i<PBP_DIAG_MAX_EPOCH) g_pbp_diag.epoch_backsub_ok[i]=0;
+            } else {
+                g_pbp_neq.day1_fixed_clock[i]=0.0;
+                n_none++;
+            }
+        }
+
+        /* Pass 2: apply datum offset to fixed epochs, leave float as-is */
+        if(cnt_off>0){
+            double mean_off=sum_off/cnt_off;
+            for(i=0;i<ne;i++){
+                if(g_pbp_neq.epoch_has_neq && g_pbp_neq.epoch_has_neq[i])
+                    g_pbp_neq.day1_fixed_clock[i]-=mean_off;
+                /* float-fallback and none epochs: untouched */
+            }
+            fprintf(stderr,"[PBP-NEQ] datum: %.3f ns from %d fixed epochs\n",
+                    mean_off*1e9/CLIGHT,cnt_off);
+        }
+        fprintf(stderr,"[PBP-NEQ] clk: fixed=%d float_fb=%d none=%d / %d\n",
+                n_fixed,n_float_fb,n_none,ne);
+    }
+    free(xhat);
+
+    g_pbp_neq.ready=1;
+
+    /* ── Diagnostic summary ────────────────────────────────────────────── */
+    {
+        int total_bs=g_pbp_diag.backsub_ok_count+g_pbp_diag.backsub_fallback_count;
+        double fb_ratio = total_bs>0
+            ? (double)g_pbp_diag.backsub_fallback_count/total_bs*100.0 : 0.0;
+        fprintf(stderr,
+            "\n[PBP-DIAG] ══════════ NEQ SUMMARY ══════════\n"
+            "[PBP-DIAG] add_epoch: ok=%d / total=%d (%.1f%%)\n"
+            "[PBP-DIAG]   fail_bad_input      = %d\n"
+            "[PBP-DIAG]   fail_epoch_id        = %d\n"
+            "[PBP-DIAG]   fail_unconverged     = %d (vrms>=50m, output float)\n"
+            "[PBP-DIAG]   fail_R_invert        = %d\n"
+            "[PBP-DIAG]   fail_no_active_param = %d\n"
+            "[PBP-DIAG]   fail_alloc           = %d\n"
+            "[PBP-DIAG] epoch_collision_total  = %d\n"
+            "[PBP-DIAG] output: fixed=%d  float_fallback=%d  ratio=%.1f%%\n"
+            "[PBP-DIAG] ══════════════════════════════════\n",
+            g_pbp_diag.add_ok_total, g_pbp_diag.add_call_total,
+            g_pbp_diag.add_call_total>0
+                ? 100.0*g_pbp_diag.add_ok_total/g_pbp_diag.add_call_total : 0.0,
+            g_pbp_diag.fail_bad_input,
+            g_pbp_diag.fail_epoch_id,
+            g_pbp_diag.fail_vrms_too_large,
+            g_pbp_diag.fail_R_invert,
+            g_pbp_diag.fail_no_active_param,
+            g_pbp_diag.fail_alloc,
+            g_pbp_diag.epoch_collision_total,
+            g_pbp_diag.backsub_ok_count,g_pbp_diag.backsub_fallback_count,fb_ratio);
+    }
+    return 1;
 }
-/* post-processing positioning -------------------------------------------------
-* post-processing positioning
-* args   : gtime_t ts       I   processing start time (ts.time==0: no limit)
-*        : gtime_t te       I   processing end time   (te.time==0: no limit)
-*          double ti        I   processing interval  (s) (0:all)
-*          double tu        I   processing unit time (s) (0:all)
-*          prcopt_t *popt   I   processing options
-*          solopt_t *sopt   I   solution options
-*          filopt_t *fopt   I   file options
-*          char   **infile  I   input files (see below)
-*          int    n         I   number of input files
-*          char   *outfile  I   output file ("":stdout, see below)
-*          char   *rov      I   rover id list        (separated by " ")
-*          char   *base     I   base station id list (separated by " ")
-* return : status (0:ok,0>:error,1:aborted)
-* notes  : input files should contain observation data, navigation data, precise
-*          ephemeris/clock (optional), sbas log file (optional), ssr message
-*          log file (optional) and tec grid file (optional). only the first
-*          observation data file in the input files is recognized as the rover
-*          data.
-*
-*          the type of an input file is recognized by the file extension as ]
-*          follows:
-*              .sp3,.SP3,.eph*,.EPH*: precise ephemeris (sp3c)
-*              .sbs,.SBS,.ems,.EMS  : sbas message log files (rtklib or ems)
-*              .rtcm3,.RTCM3        : ssr message log files (rtcm3)
-*              .*i,.*I              : tec grid files (ionex)
-*              others               : rinex obs, nav, gnav, hnav, qnav or clock
-*
-*          inputs files can include wild-cards (*). if an file includes
-*          wild-cards, the wild-card expanded multiple files are used.
-*
-*          inputs files can include keywords. if an file includes keywords,
-*          the keywords are replaced by date, time, rover id and base station
-*          id and multiple session analyses run. refer reppath() for the
-*          keywords.
-*
-*          the output file can also include keywords. if the output file does
-*          not include keywords. the results of all multiple session analyses
-*          are output to a single output file.
-*
-*          ssr corrections are valid only for forward estimation.
-*-----------------------------------------------------------------------------*/
-extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
-                   const prcopt_t *popt, const solopt_t *sopt,
-                   const filopt_t *fopt, const char **infile, int n,
-                   const char *outfile, const char *rov, const char *base)
+
+extern int pbp_write_day1_fixed_clock_file(const char *path)
 {
-    gtime_t tts,tte,ttte;
-    double tunit,tss;
-    int i,j,k,nf,stat=0,week,flag=1,index[MAXINFILE]={0};
-    char *ifile[MAXINFILE],ofile[1024];
-    const char *ext;
-
-    trace(3,"postpos : ti=%.0f tu=%.0f n=%d outfile=%s\n",ti,tu,n,outfile);
-
-    /* open processing session */
-    if (!openses(popt,sopt,fopt,&navs,&pcvss,&pcvsr)) return -1;
-
-    /* --------------------------------------------------------------------- */
-    /* case 1) time range specified (ts & te valid) */
-    /* --------------------------------------------------------------------- */
-    if (ts.time!=0 && te.time!=0 && tu>=0.0) {
-
-        if (timediff(te,ts)<0.0) {
-            showmsg("error : no period");
-            closeses(&navs,&pcvss,&pcvsr);
-            return 0;
-        }
-
-        for (i=0;i<MAXINFILE;i++) {
-            if (!(ifile[i]=(char *)malloc(1024))) {
-                for (;i>=0;i--) free(ifile[i]);
-                closeses(&navs,&pcvss,&pcvsr);
-                return -1;
-            }
-        }
-
-        if (tu==0.0||tu>86400.0*MAXPRCDAYS) tu=86400.0*MAXPRCDAYS;
-
-        /*
-         * PATCH: If the output file name has no time keywords ('%'), do not split
-         * processing into many small time-windows (tu). Otherwise each window may
-         * re-initialize output/stat files in some variants and leave only the last
-         * window in the final .pos/.stat files.
-         */
-        if (tu>0.0 && outfile && *outfile && !strchr(outfile,'%')) {
-            tu=86400.0*MAXPRCDAYS;
-        }
-        settspan(ts,te);
-        tunit=tu<86400.0?tu:86400.0;
-        tss=tunit*(int)floor(time2gpst(ts,&week)/tunit);
-
-        for (i=0;;i++) { /* for each periods */
-            tts=gpst2time(week,tss+i*tu);
-            tte=timeadd(tts,tu-DTTOL);
-            if (timediff(tts,te)>0.0) break;
-            if (timediff(tts,ts)<0.0) tts=ts;
-            if (timediff(tte,te)>0.0) tte=te;
-
-            strcpy(proc_rov ,"");
-            strcpy(proc_base,"");
-            if (checkbrk("reading    : %s",time_str(tts,0))) {
-                stat=1;
-                break;
-            }
-
-            for (j=k=nf=0;j<n;j++) {
-                ext=strrchr(infile[j],'.');
-
-                if (ext&&(!strcmp(ext,".rtcm3")||!strcmp(ext,".RTCM3"))) {
-                    strcpy(ifile[nf++],infile[j]);
-                }
-                else {
-                    ttte=tte;
-                    if (ext&&(!strcmp(ext,".sp3")||!strcmp(ext,".SP3")||
-                              !strcmp(ext,".eph")||!strcmp(ext,".EPH"))) {
-                        ttte=timeadd(ttte,3600.0);
-                    }
-                    else if (strstr(infile[j],"brdc")) {
-                        ttte=timeadd(ttte,7200.0);
-                    }
-                    nf+=reppaths(infile[j],ifile+nf,MAXINFILE-nf,tts,ttte,"","");
-                }
-                while (k<nf) index[k++]=j;
-
-                if (nf>=MAXINFILE) {
-                    trace(2,"too many input files. trancated\n");
-                    break;
-                }
-            }
-
-            if (!reppath(outfile,ofile,tts,"","") && i>0) flag=0;
-
-            stat=execses_b(tts,tte,ti,popt,sopt,fopt,flag,
-                           (const char **)ifile,index,nf,(const char *)ofile,rov,base);
-
-            if (stat==0) {
-                processed_days++;
-                printf("Day %d processing completed\n", processed_days);
-            }
-            if (stat==1) break;
-        }
-
-        for (i=0;i<MAXINFILE;i++) free(ifile[i]);
+    const double M2NS=1e9/CLIGHT;
+    int e,n_w=0;
+    if(!path||!*path||!g_pbp_neq.ready||g_pbp_neq.day1_epoch_count<=0)return 0;
+    createdir(path);
+    FILE *fp=fopen(path,"w");if(!fp)return 0;
+    fprintf(fp,"# PBP fixed GPS clock (day1, all-in-one Cholesky)  unit: ns\n");
+    for(e=0;e<g_pbp_neq.day1_epoch_count;e++){
+        if(!g_pbp_neq.epoch_valid||!g_pbp_neq.epoch_valid[e])continue;
+        gtime_t t=g_pbp_neq.epoch_time[e];double ep[6];time2epoch(t,ep);
+        fprintf(fp,"%04d/%02d/%02d %02d:%02d:%02d %.3f\n",
+                (int)ep[0],(int)ep[1],(int)ep[2],
+                (int)ep[3],(int)ep[4],(int)floor(ep[5]+0.5),
+                g_pbp_neq.day1_fixed_clock[e]*M2NS);
+        n_w++;
     }
+    fclose(fp);
+    fprintf(stderr,"[PBP-NEQ] wrote: %s (%d ep)\n",path,n_w);
+    return 1;
+}
 
-    /* --------------------------------------------------------------------- */
-    /* case 2) only ts specified */
-    /* --------------------------------------------------------------------- */
-    else if (ts.time!=0) {
+extern int pbp_get_fixed_clock(gtime_t t,int sys_idx,double *clk)
+{
+    if(!g_pbp_neq.ready||!clk||sys_idx!=0)return 0;
+    int e=pbp_epoch_id_day1(t);
+    if(e<0||e>=g_pbp_neq.n_epoch||!g_pbp_neq.epoch_valid[e])return 0;
+    *clk=g_pbp_neq.day1_fixed_clock[e];return 1;
+}
 
-        for (i=0;i<n&&i<MAXINFILE;i++) {
-            if (!(ifile[i]=(char *)malloc(1024))) {
-                for (;i>=0;i--) free(ifile[i]);
-                closeses(&navs,&pcvss,&pcvsr);
-                return -1;
-            }
-            reppath(infile[i],ifile[i],ts,"","");
-            index[i]=i;
-        }
-        reppath(outfile,ofile,ts,"","");
+extern int pbp_get_fixed_arc_bias(gtime_t t,int sat,double *bias,double *var)
+{(void)t;(void)sat;(void)bias;(void)var;return 0;}
 
-        stat=execses_b(ts,te,ti,popt,sopt,fopt,1,
-                       (const char **)ifile,index,n,ofile,rov,base);
-
-        if (stat==0) {
-            processed_days++;
-            printf("Day %d processing completed\n", processed_days);
-        }
-
-        for (i=0;i<n&&i<MAXINFILE;i++) free(ifile[i]);
+/* ── Diagnostic CSV output (requirement 6) ─────────────────────────────── */
+extern int pbp_write_diag_csv(const char *path)
+{
+    int e,ne;
+    if(!path||!*path)return 0;
+    ne=g_pbp_neq.n_epoch;
+    if(ne<=0)return 0;
+    createdir(path);
+    FILE *fp=fopen(path,"w");
+    if(!fp){fprintf(stderr,"[PBP-DIAG] cannot open %s\n",path);return 0;}
+    fprintf(fp,"epoch_id,time,hit_count,nv_last,nact_last,backsub_ok\n");
+    for(e=0;e<ne&&e<PBP_DIAG_MAX_EPOCH;e++){
+        gtime_t t=g_pbp_neq.epoch_time[e];
+        double ep[6]; time2epoch(t,ep);
+        fprintf(fp,"%d,%04d/%02d/%02d %02d:%02d:%02d,%d,%d,%d,%d\n",
+                e,(int)ep[0],(int)ep[1],(int)ep[2],
+                (int)ep[3],(int)ep[4],(int)floor(ep[5]+0.5),
+                g_pbp_diag.epoch_hit_count[e],
+                g_pbp_diag.epoch_nv_last[e],
+                g_pbp_diag.epoch_nact_last[e],
+                g_pbp_diag.epoch_backsub_ok[e]);
     }
+    fclose(fp);
+    fprintf(stderr,"[PBP-DIAG] wrote: %s (%d rows)\n",path,ne<PBP_DIAG_MAX_EPOCH?ne:PBP_DIAG_MAX_EPOCH);
+    return 1;
+}
 
-    /* --------------------------------------------------------------------- */
-    /* case 3) ts/te not specified: auto-detect obs range and process by natural day */
-    /* --------------------------------------------------------------------- */
-    else {
-
-        obs_t obs_temp={0};
-        nav_t nav_temp={0};
-        sta_t sta_temp[MAXRCV]={{0}};
-        gtime_t ts_auto={0}, te_auto={0};
-
-        for (i=0;i<n;i++) index[i]=i;
-
-        for (i=0;i<MAXINFILE;i++) {
-            if (!(ifile[i]=(char *)malloc(1024))) {
-                for (;i>=0;i--) free(ifile[i]);
-                closeses(&navs,&pcvss,&pcvsr);
-                return -1;
-            }
-        }
-
-        trace(3,"Reading obs files to determine time range\n");
-
-        if (!readobsnav(ts,te,ti,infile,index,n,popt,&obs_temp,&nav_temp,sta_temp)) {
-            if (obs_temp.data) free(obs_temp.data);
-            for (i=0;i<MAXINFILE;i++) free(ifile[i]);
-            closeses(&navs,&pcvss,&pcvsr);
-            return -1;
-        }
-
-        if (obs_temp.n > 0) {
-
-            /* robust scan min/max time */
-            ts_auto = obs_temp.data[0].time;
-            te_auto = obs_temp.data[0].time;
-            for (i=1;i<obs_temp.n;i++) {
-                if (timediff(obs_temp.data[i].time, ts_auto) < 0.0) ts_auto = obs_temp.data[i].time;
-                if (timediff(obs_temp.data[i].time, te_auto) > 0.0) te_auto = obs_temp.data[i].time;
-            }
-            free(obs_temp.data);
-            obs_temp.data = NULL;
-
-            /* align to natural day boundary */
-            {
-                int week_start, week_end;
-                double sow_start = time2gpst(ts_auto, &week_start);
-                double sow_end   = time2gpst(te_auto, &week_end);
-
-                int doy_start = (int)(sow_start/86400.0);
-                int doy_end   = (int)(sow_end  /86400.0);
-
-                gtime_t day_aligned_start = gpst2time(week_start, doy_start*86400.0);
-                gtime_t day_aligned_end   = gpst2time(week_end, (doy_end+1)*86400.0 - DTTOL);
-
-                int num_days = doy_end - doy_start + 1;
-                if (week_end != week_start) {
-                    num_days = (int)((timediff(day_aligned_end, day_aligned_start)+DTTOL)/86400.0) + 1;
-                }
-
-                printf("Auto-detected obs range: %s to %s\n",
-                       time_str(ts_auto,0), time_str(te_auto,0));
-                printf("Day-aligned processing: %s to %s (%d natural days)\n",
-                       time_str(day_aligned_start,0), time_str(day_aligned_end,0), num_days);
-
-                /* ============================================================= */
-                /* Pass-by-Pass driver (only when >=2 days) */
-                /* ============================================================= */
-                if (popt->armode_pbp >= 1 && num_days >= 2) {
-
-                    /* these are provided by your PBP modules */
-                    extern void init_arc_data(void);
-                    extern int  ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs);
-                    extern int  pbp_day_tag, pbp_collect_flag, pbp_apply_flag, pbp_resolve_flag, pbp_neq_accum_flag, pbp_current_day;
-                    extern int  pbp_neq_init(gtime_t t0, gtime_t t1, double ti, const prcopt_t *opt);
-                    extern int  pbp_finalize_final_neq(void);
-                    extern void pbp_set_day_window(int day, gtime_t ts, gtime_t te, double ti);
-                    extern int  pbp_write_day1_fixed_clock_file(const char *path);
-                    extern int  n_ddamb;
-                    extern int  refsat;
-
-                    int day_ok0 = 0, day_ok1 = 0;
-                    prcopt_t popt_run = *popt;
-
-
-                    /* IMPORTANT: avoid ppp_ar_48h calling apply_ar_fixed on NULL rtk */
-                    prcopt_t popt_ar  = *popt;
-                    //if (popt_ar.armode_pbp >= 3) popt_ar.armode_pbp = 2;
-
-                    init_arc_data();
-                    n_ddamb = 0;
-                    refsat  = 0;
-
-                    /* precompute actual day windows and initialize global NEQ once */
-                    gtime_t pbp_day_start[2], pbp_day_end[2];
-                    for (i=0;i<2;i++) {
-                        int current_week;
-                        double current_sow;
-                        current_sow  = (doy_start + i) * 86400.0;
-                        current_week = week_start;
-                        while (current_sow >= 604800.0) { current_sow -= 604800.0; current_week++; }
-                        pbp_day_start[i] = gpst2time(current_week, current_sow);
-                        pbp_day_end[i]   = timeadd(pbp_day_start[i], 86400.0 - DTTOL);
-                        if (timediff(pbp_day_start[i], ts_auto) < 0.0) pbp_day_start[i] = ts_auto;
-                        if (timediff(pbp_day_end[i],   te_auto) > 0.0) pbp_day_end[i]   = te_auto;
-                    }                
-                    {
-                        int neq_ok = pbp_neq_init(pbp_day_start[0], pbp_day_end[1], ti, &popt_run);
-                        if (!neq_ok) {
-                            printf("[PBP] ERROR: pbp_neq_init failed (memory allocation?). "
-                                   "Check n_clk_sys. Falling back to per-day processing.\n");
-                            fprintf(stderr,"[PBP-NEQ] pbp_neq_init returned 0 – aborting PBP path\n");
-                        }
-
-                    /* ---------- PASS1: day0/day1 float + collect ---------- */
-                    if (neq_ok) {
-                    pbp_collect_flag = 1;
-                    pbp_apply_flag   = 0;
-
-                    for (i=0;i<2;i++) {
-
-                        gtime_t day_start, day_end;
-
-                        day_start = pbp_day_start[i];
-                        day_end   = pbp_day_end[i];
-
-                        printf("\n[PBP] Pass1 (float+collect) day %d: %s to %s\n", i+1,
-                               time_str(day_start,0), time_str(day_end,0));
-
-                        /* build file list */
-                        for (j=k=nf=0;j<n;j++) {
-
-                            ttte = day_end;
-
-                            /* IMPORTANT: B2b may need next day (you can adjust here if you want) */
-                            if (strstr(infile[j],"b2b") || strstr(infile[j],"B2b")) {
-                                ttte = timeadd(ttte, 86400.0);
-                            }
-                            else if (strstr(infile[j],"brdc")) {
-                                ttte = timeadd(ttte, 7200.0);
-                            }
-
-                            nf += reppaths(infile[j], ifile+nf, MAXINFILE-nf, day_start, ttte, "", "");
-                            while (k<nf) index[k++]=j;
-
-                            if (nf>=MAXINFILE) {
-                                trace(2,"too many input files. truncated\n");
-                                break;
-                            }
-                        }
-
-                        /* output float file (avoid overwrite) */
-                        if (outfile && *outfile) {
-                            char tmp[1024];
-                            reppath(outfile, tmp, day_start, "", "");
-                            snprintf(ofile, sizeof(ofile), "%s.pbpfloatD%d", tmp, i+1);
-                        }
-                        else {
-                            strcpy(ofile, "");
-                        }
-
-                        pbp_day_tag = i; /* force day tag for ambiguity collector */
-                        pbp_current_day = i;
-                        pbp_set_day_window(i, day_start, day_end, ti);
-                        pbp_neq_accum_flag = 1;
-
-                        /* ensure B2b SSR restarts from the correct daily file */
-                        reset_B2b_reader(i);
-
-                        stat = execses_b(day_start, day_end, ti, &popt_run, sopt, fopt, 1,
-                                         (const char **)ifile, index, nf, ofile, rov, base);
-                        pbp_neq_accum_flag = 0;
-
-                        if (i==0 && stat==0) day_ok0 = 1;
-                        if (i==1 && stat==0) day_ok1 = 1;
-                        if (stat==1) break; /* user abort */
-                    }
-
-                    pbp_collect_flag = 0;
-                    pbp_day_tag = -1;
-
-                    if (stat!=1 && day_ok0 && day_ok1) {
-
-                        printf("\n[PBP] Solving WL/NL and building fixed DD set ...\n");
-
-                        if (ppp_ar_48h(&popt_ar, NULL, NULL) > 0 && popt->armode_pbp >= 3) {
-
-                            char statfile[1024] = {0};
-                            if (outfile && *outfile) {
-                                char tmp[1024];
-                                reppath(outfile, tmp, pbp_day_start[1], "", "");
-                                /* [FIX] Use .pbp_fixclk instead of .stat to avoid overwriting
-                                 * the EKF residual statistics file written by execses() */
-                                snprintf(statfile, sizeof(statfile), "%s.pbp_fixclk", tmp);
-                            }
-
-                            if (stat==0 && pbp_finalize_final_neq()) {
-                                if (*statfile) {
-                                    if (!pbp_write_day1_fixed_clock_file(statfile)) {
-                                        printf("[PBP] ERROR: failed to write fixed clock file: %s\n", statfile);
-                                        stat = -1;
-                                    }
-                                }
-                                else {
-                                    printf("[PBP] ERROR: invalid output file path for fixed clock file.\n");
-                                    stat = -1;
-                                }
-                            }
-
-                            pbp_day_tag = -1;
-                            pbp_current_day = -1;
-                            pbp_resolve_flag = 0;
-                            pbp_neq_accum_flag = 0;
-                            if (stat==0) processed_days = 2;
-                        }
-                        else {
-                            /* only collect/solve, or AR failed */
-                            processed_days = 2;
-                        }
-                    }
-                    else {
-                        /* fallback: original per-day processing */
-                        printf("[PBP] Warning: pass1 failed, fallback to per-day processing.\n");                    }
-                    } /* end neq_ok guard */
-                    } /* end pbp_neq_init scope */
-                }
-                /* (pbp_neq_init_failed label removed; use flag approach above) */
-
-                /* ============================================================= */
-                /* Original per-day processing (when not PBP) */
-                /* ============================================================= */
-                else {
-
-                    for (i=0; i<num_days; i++) {
-
-                        gtime_t day_start, day_end;
-                        int current_week;
-                        double current_sow;
-
-                        current_sow  = (doy_start + i) * 86400.0;
-                        current_week = week_start;
-
-                        while (current_sow >= 604800.0) {
-                            current_sow -= 604800.0;
-                            current_week++;
-                        }
-
-                        day_start = gpst2time(current_week, current_sow);
-                        day_end   = timeadd(day_start, 86400.0 - DTTOL);
-
-                        if (timediff(day_start, ts_auto) < 0.0) day_start = ts_auto;
-                        if (timediff(day_end,   te_auto) > 0.0) day_end   = te_auto;
-
-                        printf("\nProcessing natural day %d: %s to %s\n", i+1,
-                               time_str(day_start,0), time_str(day_end,0));
-
-                        for (j=k=nf=0;j<n;j++) {
-
-                            ext=strrchr(infile[j],'.');
-
-                            if (ext&&(!strcmp(ext,".rtcm3")||!strcmp(ext,".RTCM3"))) {
-                                strcpy(ifile[nf++],infile[j]);
-                            }
-                            else {
-                                ttte=day_end;
-                                if (ext&&(!strcmp(ext,".sp3")||!strcmp(ext,".SP3")||
-                                          !strcmp(ext,".eph")||!strcmp(ext,".EPH"))) {
-                                    ttte=timeadd(ttte,3600.0);
-                                }
-                                else if (strstr(infile[j],"brdc")) {
-                                    ttte=timeadd(ttte,7200.0);
-                                }
-                                nf+=reppaths(infile[j],ifile+nf,MAXINFILE-nf,day_start,ttte,"","");
-                            }
-                            while (k<nf) index[k++]=j;
-
-                            if (nf>=MAXINFILE) {
-                                trace(2,"too many input files. truncated\n");
-                                break;
-                            }
-                        }
-
-                        reppath(outfile,ofile,day_start,"","");
-
-                        /* ensure B2b SSR starts from the correct daily file */
-                        reset_B2b_reader(i);
-
-                        stat=execses_b(day_start,day_end,ti,popt,sopt,fopt,1,
-                                       (const char **)ifile,index,nf,ofile,rov,base);
-
-                        if (stat==0) {
-                            processed_days++;
-                            printf("Day %d processing completed\n", processed_days);
-                        }
-                        else {
-                            printf("Day %d processing failed\n", i+1);
-                            if (stat==1) break;
-                        }
-                    }
-                }
-            } /* end day-align scope */
-        }
-
-        /* obs_temp.n == 0 */
-        else {
-            if (obs_temp.data) free(obs_temp.data);
-            stat=execses_b(ts,te,ti,popt,sopt,fopt,1,infile,index,n,outfile,rov,base);
-            if (stat==0) {
-                processed_days++;
-                printf("Day %d processing completed\n", processed_days);
-            }
-        }
-
-        for (i=0;i<MAXINFILE;i++) free(ifile[i]);
-    }
-
-    /* close processing session */
-    closeses(&navs,&pcvss,&pcvsr);
-
-    /* Output processing summary */
-    if (processed_days == 0) {
-        printf("\nNo complete day processed\n");
-    } else if (processed_days == 1) {
-        printf("\n1 day only\n");
-    } else if (processed_days == 2) {
-        printf("\n2 days complete\n");
-    } else {
-        printf("\n%d days complete\n", processed_days);
-    }
-
-    processed_days = 0;
-    return stat;
+/* ── Legacy stubs ─────────────────────────────────────────────────────── */
+extern int pbp_apply_session_pseudoobs(rtk_t *rtk){(void)rtk;return 0;}
+extern int apply_ar_fixed(rtk_t *rtk,const ddamb_t *ddamb,int n_dd)
+{(void)rtk;(void)ddamb;(void)n_dd;return 0;}
+extern int pbp_bds_is_sidereal(int sat)
+{
+    int prn=0;
+    if(satsys(sat,&prn)!=SYS_CMP)return 0;
+    if(prn>=1&&prn<=10)return 1;
+    if(prn==13||prn==16)return 1;
+    if(prn>=38&&prn<=40)return 1;
+    if(prn>=59&&prn<=62)return 1;
+    return 0;
 }
