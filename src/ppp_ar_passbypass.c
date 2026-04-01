@@ -382,22 +382,33 @@ extern int collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n,
         a->te = time;
         a->nobs++;
 
-            /* ── A. IF: arc-level inverse-variance weighted fusion ───────────────
-         * Using only the last epoch can keep arc variance too large and make
-         * cross-day DD NL fixing over-conservative. Here we fuse epoch IF
-         * estimates by 1/var weights to get a stable arc-level IF and variance.
+            /* ── A. IF: always use current (latest) epoch's EKF estimate ──────────
+         * The EKF state at the last epoch is the optimal estimate incorporating
+         * all prior observations.  Its variance P[ib,ib] is the correct marginal
+         * uncertainty.
+         *
+         * The previous inverse-variance weighted mean treated correlated EKF
+         * epoch estimates as independent, deflating var_IF by ~N_epochs (e.g.
+         * 360x for a 3-hour arc at 30s).  This made the NL decision function ξ
+         * vacuous — every DD with |frac|<0.2 passed the 99.9% test, including
+         * WRONG integers.  Wrong DD constraints inject systematic arc-level
+         * biases into the clock via NEQ cross-correlations, degrading MDEV at
+         * long τ.
+         *
+         * Using the last epoch's variance is conservative but CORRECT: it may
+         * leave some fixable ambiguities unfixed, but the ones that ARE fixed
+         * are reliable.  The DD validation step in finalize() provides an
+         * additional safety net.
          */
         if (var_IF > 0.0) {
-            if (a->nobs <= 1 || a->var_IF <= 0.0) {
-                a->N_IF   = N_IF;
-                a->var_IF = var_IF;
-            }
-            else {
-                const double w_old = 1.0 / a->var_IF;
-                const double w_new = 1.0 / var_IF;
-                a->N_IF   = (a->N_IF * w_old + N_IF * w_new) / (w_old + w_new);
-                a->var_IF = 1.0 / (w_old + w_new);
-            }
+            /* Variance floor: (3mm)^2 = 9e-6 m^2 per arc.
+             * For DD_IF this gives floor = 4*9e-6 = 3.6e-5 m^2, std=6mm.
+             * NL std floor = 6mm / C_nl(~0.107m) ≈ 0.056 cycles.
+             * This prevents fixing with unrealistically high confidence
+             * while still allowing most legitimate fixes to pass. */
+            const double VAR_IF_FLOOR = 9.0e-6; /* (3 mm)^2 */
+            a->N_IF   = N_IF;
+            a->var_IF = (var_IF > VAR_IF_FLOOR) ? var_IF : VAR_IF_FLOOR;
         }
         /* if var_IF <= 0 (degenerate): keep previous valid variance */
 
@@ -1237,7 +1248,7 @@ extern int pbp_finalize_final_neq(void)
         free(wc);free(cmap);
     }
 
-    /* ── Compute bc from NEQ linearization points and inject DD ──────
+    /* ── Compute bc, validate against float solution, then inject DD ──────
      *
      * Correct bc in the NEQ correction space (dx = x_true - x_lin_eff):
      *   dx_ref - dx_sat = -DD_IF_fix + (b_ref_d0 - b_sat_d0)
@@ -1246,14 +1257,22 @@ extern int pbp_finalize_final_neq(void)
      * xlin_ref/sat = weighted-mean x_lin for each arc, tracked exactly
      * during NEQ accumulation (xlin_wsum/xlin_wdenom).
      *
-     * Previous code used satamb N_IF (EKF filtered) instead of xlin.
-     * The per-arc mismatch (satamb ≠ xlin) created arc-dependent bc
-     * errors that propagated to arc-level clock biases → TDEV ↑ at
-     * τ ≈ arc duration (3000-10000s).
+     * VALIDATION (new): After Pass A, the float solution xhat_float gives
+     * the best batch estimate.  For each DD constraint, check if the float
+     * arc values are consistent with the integer constraint:
+     *   residual = (dx_ref_float - dx_sat_float) - bc
+     * In NL cycles: res_nl = residual / C_nl
+     * If |res_nl| > 0.25, the integer is likely wrong → skip this DD.
      *
-     * Using xlin is EXACT for the NEQ. The common-mode offset between
-     * xlin and satamb is handled by datum alignment. */
-    int dd_ok=0;
+     * This catches wrong integers that passed the initial ξ test due to
+     * variance underestimation or systematic biases. */
+
+    /* NL wavelength C for validation threshold (GPS L1/L2) */
+    const double f1_v=FREQ_GPS_L1, f2_v=FREQ_GPS_L2;
+    const double C_nl = f1_v*f1_v/(f1_v*f1_v-f2_v*f2_v)*(CLIGHT/f1_v)
+                      - f2_v*f2_v/(f1_v*f1_v-f2_v*f2_v)*(CLIGHT/f2_v);
+    const double DD_VAL_THRESH_NL = 0.25; /* reject if |res| > 0.25 NL cycles */
+    int dd_ok=0, dd_rejected=0;
     for(i=0;i<g_pbp_neq.n_ddc;i++){
         int cr=g_pbp_neq.ddc[i].col_ref, cs=g_pbp_neq.ddc[i].col_sat;
         double wt=g_pbp_neq.ddc[i].weight;
@@ -1272,13 +1291,37 @@ extern int pbp_finalize_final_neq(void)
                   + (xlin_sat - xlin_ref);
         g_pbp_neq.ddc[i].bc = bc;
 
+        /* ── DD validation against Pass A float solution ──────────────
+         * The float NEQ solution gives the optimal unconstrained arc values.
+         * If the DD constraint disagrees with the float solution by more than
+         * 0.25 NL cycles, the integer is almost certainly wrong.  Injecting
+         * a wrong constraint would introduce a systematic bias (~10 cm in IF)
+         * that propagates to clock through NEQ cross-correlations, degrading
+         * MDEV at long τ far more than leaving the ambiguity float. */
+        {
+            double dx_ref_f = (cr>=0&&cr<nt) ? xhat_float[cr] : 0.0;
+            double dx_sat_f = (cs>=0&&cs<nt) ? xhat_float[cs] : 0.0;
+            double res = (dx_ref_f - dx_sat_f) - bc;
+            double res_nl = (fabs(C_nl) > 1e-12) ? fabs(res) / C_nl : 9.9;
+            if (res_nl > DD_VAL_THRESH_NL) {
+                char sid1[8], sid2[8];
+                satno2id(g_pbp_neq.ddc[i].sat1, sid1);
+                satno2id(g_pbp_neq.ddc[i].sat2, sid2);
+                fprintf(stderr, "[PBP-NEQ] DD REJECTED %s-%s: "
+                        "res=%.4f m (%.3f NL cyc) > %.2f threshold\n",
+                        sid1, sid2, res, res_nl, DD_VAL_THRESH_NL);
+                dd_rejected++;
+                continue; /* skip this DD constraint */
+            }
+        }
+
         g_pbp_neq.N[cr+(size_t)cr*nt]+=wt;g_pbp_neq.N[cs+(size_t)cs*nt]+=wt;
         g_pbp_neq.N[cr+(size_t)cs*nt]-=wt;g_pbp_neq.N[cs+(size_t)cr*nt]-=wt;
         g_pbp_neq.w[cr]+=wt*bc;g_pbp_neq.w[cs]-=wt*bc;
         dd_ok++;
     }
-    fprintf(stderr,"[PBP-NEQ] DD injected: %d/%d (Pb=%.0e, bc from xlin)\n",
-            dd_ok,g_pbp_neq.n_ddc,pbp_pb_weight);
+    fprintf(stderr,"[PBP-NEQ] DD injected: %d/%d rejected: %d (Pb=%.0e, bc from xlin)\n",
+            dd_ok,g_pbp_neq.n_ddc,dd_rejected,pbp_pb_weight);
 
     /* ── Pass B: NEQ fixed (with DD) ───────────────────────────────── */
     {
