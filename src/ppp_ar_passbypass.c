@@ -671,6 +671,8 @@ typedef struct {
     int sat1, sat2;
     double bc, weight;
     int col_ref, col_sat;
+    double DD_IF_fix;      /* integer-fixed DD IF value */
+    double b_ref_d0, b_sat_d0; /* day0 float arc values (known constants) */
 } pbp_ddcon_t;
 
 typedef struct {
@@ -1129,7 +1131,6 @@ extern int pbp_neq_add_epoch(rtk_t *rtk,const obsd_t *obs,int n,
 extern int pbp_store_fixed_constraints(const ddamb_t *dd,int n_dd,double Pb)
 {
     int i,r0,r1,s0,s1,ref,sat,col_ref,col_sat;
-    double bc;
     pbp_pb_weight=Pb>0?Pb:1e10;
     if(!dd||n_dd<=0)return 0;
     if(!pbp_build_arc_columns())return 0;
@@ -1148,17 +1149,20 @@ extern int pbp_store_fixed_constraints(const ddamb_t *dd,int n_dd,double Pb)
          if(g_pbp_neq.arc_cols[ai_r].xlin_wdenom<=0||
             g_pbp_neq.arc_cols[ai_s].xlin_wdenom<=0)continue;}
 
-        bc = -(dd[i].DD_IF_fix - dd[i].DD_IF);
-
+        /* Store DD info — bc will be computed in finalize() after Pass A,
+         * using xhat_float to ensure perfect consistency with the NEQ. */
         g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat1=ref;
         g_pbp_neq.ddc[g_pbp_neq.n_ddc].sat2=sat;
-        g_pbp_neq.ddc[g_pbp_neq.n_ddc].bc=bc;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].bc=0.0; /* placeholder */
         g_pbp_neq.ddc[g_pbp_neq.n_ddc].weight=pbp_pb_weight;
         g_pbp_neq.ddc[g_pbp_neq.n_ddc].col_ref=col_ref;
         g_pbp_neq.ddc[g_pbp_neq.n_ddc].col_sat=col_sat;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].DD_IF_fix=dd[i].DD_IF_fix;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].b_ref_d0=satamb[ref-1].arc[r0].N_IF;
+        g_pbp_neq.ddc[g_pbp_neq.n_ddc].b_sat_d0=satamb[sat-1].arc[s0].N_IF;
         g_pbp_neq.n_ddc++;
     }
-    fprintf(stderr,"[PBP-NEQ] DD: %d\n",g_pbp_neq.n_ddc);
+    fprintf(stderr,"[PBP-NEQ] DD stored: %d (bc deferred to finalize)\n",g_pbp_neq.n_ddc);
     return g_pbp_neq.n_ddc;
 }
 
@@ -1233,17 +1237,48 @@ extern int pbp_finalize_final_neq(void)
         free(wc);free(cmap);
     }
 
-    /* ── Inject DD constraints into N/w ────────────────────────────── */
+    /* ── Compute bc from NEQ linearization points and inject DD ──────
+     *
+     * Correct bc in the NEQ correction space (dx = x_true - x_lin_eff):
+     *   dx_ref - dx_sat = -DD_IF_fix + (b_ref_d0 - b_sat_d0)
+     *                     + (xlin_sat - xlin_ref)
+     *
+     * xlin_ref/sat = weighted-mean x_lin for each arc, tracked exactly
+     * during NEQ accumulation (xlin_wsum/xlin_wdenom).
+     *
+     * Previous code used satamb N_IF (EKF filtered) instead of xlin.
+     * The per-arc mismatch (satamb ≠ xlin) created arc-dependent bc
+     * errors that propagated to arc-level clock biases → TDEV ↑ at
+     * τ ≈ arc duration (3000-10000s).
+     *
+     * Using xlin is EXACT for the NEQ. The common-mode offset between
+     * xlin and satamb is handled by datum alignment. */
     int dd_ok=0;
     for(i=0;i<g_pbp_neq.n_ddc;i++){
-        int cr=g_pbp_neq.ddc[i].col_ref,cs=g_pbp_neq.ddc[i].col_sat;
-        double bc=g_pbp_neq.ddc[i].bc,wt=g_pbp_neq.ddc[i].weight;
+        int cr=g_pbp_neq.ddc[i].col_ref, cs=g_pbp_neq.ddc[i].col_sat;
+        double wt=g_pbp_neq.ddc[i].weight;
         if(cr<0||cr>=nt||cs<0||cs>=nt)continue;
+
+        /* NEQ linearization points for day1 arcs */
+        int ai_r=cr-g_pbp_neq.n_xyz, ai_s=cs-g_pbp_neq.n_xyz;
+        double xlin_ref=0,xlin_sat=0;
+        if(ai_r>=0&&g_pbp_neq.arc_cols[ai_r].xlin_wdenom>0)
+            xlin_ref=g_pbp_neq.arc_cols[ai_r].xlin_wsum/g_pbp_neq.arc_cols[ai_r].xlin_wdenom;
+        if(ai_s>=0&&g_pbp_neq.arc_cols[ai_s].xlin_wdenom>0)
+            xlin_sat=g_pbp_neq.arc_cols[ai_s].xlin_wsum/g_pbp_neq.arc_cols[ai_s].xlin_wdenom;
+
+        double bc = -g_pbp_neq.ddc[i].DD_IF_fix
+                  + (g_pbp_neq.ddc[i].b_ref_d0 - g_pbp_neq.ddc[i].b_sat_d0)
+                  + (xlin_sat - xlin_ref);
+        g_pbp_neq.ddc[i].bc = bc;
+
         g_pbp_neq.N[cr+(size_t)cr*nt]+=wt;g_pbp_neq.N[cs+(size_t)cs*nt]+=wt;
         g_pbp_neq.N[cr+(size_t)cs*nt]-=wt;g_pbp_neq.N[cs+(size_t)cr*nt]-=wt;
         g_pbp_neq.w[cr]+=wt*bc;g_pbp_neq.w[cs]-=wt*bc;
         dd_ok++;
     }
+    fprintf(stderr,"[PBP-NEQ] DD injected: %d/%d (Pb=%.0e, bc from xlin)\n",
+            dd_ok,g_pbp_neq.n_ddc,pbp_pb_weight);
 
     /* ── Pass B: NEQ fixed (with DD) ───────────────────────────────── */
     {
