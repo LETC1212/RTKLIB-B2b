@@ -2140,16 +2140,16 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
 
                     pbp_collect_flag = 0;
                     pbp_day_tag = -1;
-
+                    char tmp[1024];
                     if (stat!=1 && day_ok0 && day_ok1) {
 
                         printf("\n[PBP] Solving WL/NL and building fixed DD set ...\n");
 
                         if (ppp_ar_48h(&popt_ar, NULL, NULL) > 0 && popt->armode_pbp >= 3) {
-                            char tmp[1024];
+
                             char statfile[1024] = {0};
                             if (outfile && *outfile) {
-                             
+                                
                                 reppath(outfile, tmp, pbp_day_start[1], "", "");
                                 /* [FIX] Use .pbp_fixclk instead of .stat to avoid overwriting
                                  * the EKF residual statistics file written by execses() */
@@ -2165,9 +2165,13 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                                     /* Write diagnostic CSV alongside */
                                     {
                                         extern int pbp_write_diag_csv(const char *path);
-                                        char diagfile[1024];
+                                        extern int pbp_write_day1_neqfloat_clock_file(const char *path);
+                                        char diagfile[1024], floatfile[1024];
                                         snprintf(diagfile,sizeof(diagfile),"%s.pbp_neq_diag.csv",tmp);
                                         pbp_write_diag_csv(diagfile);
+                                        snprintf(floatfile,sizeof(floatfile),"%s.pbp_floatclk",tmp);
+                                        if (!pbp_write_day1_neqfloat_clock_file(floatfile))
+                                            printf("[PBP] WARNING: failed to write NEQ float clock: %s\n",floatfile);
                                     }
                                 }
                                 else {
