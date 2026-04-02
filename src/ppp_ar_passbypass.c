@@ -382,33 +382,70 @@ extern int collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n,
         a->te = time;
         a->nobs++;
 
-            /* ── A. IF: always use current (latest) epoch's EKF estimate ──────────
-         * The EKF state at the last epoch is the optimal estimate incorporating
-         * all prior observations.  Its variance P[ib,ib] is the correct marginal
-         * uncertainty.
+            /* ── A. IF: last epoch value + conditional variance ─────────────────
          *
-         * The previous inverse-variance weighted mean treated correlated EKF
-         * epoch estimates as independent, deflating var_IF by ~N_epochs (e.g.
-         * 360x for a 3-hour arc at 30s).  This made the NL decision function ξ
-         * vacuous — every DD with |frac|<0.2 passed the 99.9% test, including
-         * WRONG integers.  Wrong DD constraints inject systematic arc-level
-         * biases into the clock via NEQ cross-correlations, degrading MDEV at
-         * long τ.
+         * VALUE: always overwrite with current epoch (last epoch = best EKF
+         * estimate incorporating all prior observations).
          *
-         * Using the last epoch's variance is conservative but CORRECT: it may
-         * leave some fixable ambiguities unfixed, but the ones that ARE fixed
-         * are reliable.  The DD validation step in finalize() provides an
-         * additional safety net.
+         * VARIANCE: use the CONDITIONAL variance P[b|clk], NOT the marginal
+         * variance P[b,b].
+         *
+         * Why: The marginal variance P[b,b] is dominated by the clock-ambiguity
+         * correlation (receiver clock is ~0.3-1m white noise).  Typical values:
+         *   P[b,b] ≈ (5-10mm)²     → DD std_NL ≈ 0.1-0.2 cycles
+         *   ξ test fails at 99.9%  → ZERO ambiguities fixed.
+         *
+         * In the DD computation, receiver clocks cancel (same-station,
+         * same-epoch between-satellite difference).  The physically relevant
+         * uncertainty is the CONDITIONAL variance with clock removed:
+         *   P[b|clk] = P[b,b] - P[b,clk]² / P[clk,clk]
+         * Typical values:
+         *   P[b|clk] ≈ (0.5-2mm)²  → DD std_NL ≈ 0.01-0.04 cycles
+         *   ξ test passes easily for correct integers.
+         *
+         * The previous inverse-variance weighted mean accidentally achieved
+         * small variance (by treating correlated epochs as independent), but
+         * the resulting value was physically meaningless and too small,
+         * causing wrong integers to be accepted.  The conditional variance
+         * is both physically correct AND the right magnitude.
+         *
+         * Variance floor (3mm)² prevents degenerate cases.
          */
         if (var_IF > 0.0) {
-            /* Variance floor: (3mm)^2 = 9e-6 m^2 per arc.
-             * For DD_IF this gives floor = 4*9e-6 = 3.6e-5 m^2, std=6mm.
-             * NL std floor = 6mm / C_nl(~0.107m) ≈ 0.056 cycles.
-             * This prevents fixing with unrealistically high confidence
-             * while still allowing most legitimate fixes to pass. */
             const double VAR_IF_FLOOR = 9.0e-6; /* (3 mm)^2 */
+
+            /* Determine system-specific clock index for this satellite */
+            int sys_s = satsys(sat, NULL), clk_k = 0;
+            switch (sys_s) {
+                case SYS_GPS: clk_k = 0; break;
+                case SYS_GLO: clk_k = 1; break;
+                case SYS_GAL: clk_k = 2; break;
+                case SYS_CMP: clk_k = 3; break;
+                case SYS_IRN: clk_k = 4; break;
+                default:      clk_k = 0; break;
+            }
+#ifdef BDS2BDS3
+            if (sys_s == SYS_CMP) {
+                int prn_s = 0; satsys(sat, &prn_s);
+                if (prn_s > 16) clk_k = NSYS;
+            }
+#endif
+            int ic = pbp_NP(&rtk->opt) + clk_k;
+
+            /* Conditional variance: remove clock contribution via Schur */
+            double var_cond = var_IF;
+            if (ic < rtk->nx && idx_IF < rtk->nx) {
+                double P_bc = rtk->P[idx_IF + (size_t)ic * rtk->nx];
+                double P_cc = rtk->P[ic + (size_t)ic * rtk->nx];
+                if (P_cc > 1e-20) {
+                    double vc = var_IF - P_bc * P_bc / P_cc;
+                    if (vc > VAR_IF_FLOOR) var_cond = vc;
+                    else                    var_cond = VAR_IF_FLOOR;
+                }
+            }
+
             a->N_IF   = N_IF;
-            a->var_IF = (var_IF > VAR_IF_FLOOR) ? var_IF : VAR_IF_FLOOR;
+            a->var_IF = (var_cond > VAR_IF_FLOOR) ? var_cond : VAR_IF_FLOOR;
         }
         /* if var_IF <= 0 (degenerate): keep previous valid variance */
 
