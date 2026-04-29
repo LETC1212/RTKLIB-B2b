@@ -1,25 +1,20 @@
 /*------------------------------------------------------------------------------
 * ppp_ar_integration.c : Integration wrapper for Pass-by-Pass AR
 *
-* v4.0 changes:
-*   [ADDED] Visible satellite counts per GPS/BDS system
-*   [CHANGED] Refined [-0.2,0.2] bin into 6 sub-bins:
-*             [0,0.1] (0.1,0.15] (0.15,0.2] [-0.1,0) [-0.15,-0.1) [-0.2,-0.15)
-*   [KEPT] Original bins for mid-range and far: [-0.4,-0.2) (0.2,0.4] etc.
-*   [KEPT] GPS / BDS per-system split statistics
-*   [KEPT] Both "all independent DD" and "fixed only" sets
+* v3.0 changes (pbp_write_dd_wlnl):
+*   [ADDED] 5-bin fraction distribution for DD WL and DD NL
+*   [ADDED] GPS / BDS per-system split statistics
+*   [ADDED] Both "all independent DD" and "fixed only" sets
+*   [KEPT]  Original |frac|<0.2 counting intact
 *
-*   10-bin definitions (pbp_frac output = signed distance to nearest integer):
-*     bin 0: [ 0.0,  0.1]      near integer (positive, tight)
-*     bin 1: ( 0.1,  0.15]     near integer (positive, medium)
-*     bin 2: ( 0.15, 0.2]      near integer (positive, edge)
-*     bin 3: [-0.1,  0.0)      near integer (negative, tight)
-*     bin 4: [-0.15,-0.1)      near integer (negative, medium)
-*     bin 5: [-0.2, -0.15)     near integer (negative, edge)
-*     bin 6: [-0.4, -0.2)      left mid-range
-*     bin 7: ( 0.2,  0.4]      right mid-range
-*     bin 8: (-inf, -0.4)      far left
-*     bin 9: ( 0.4, +inf)      far right
+*   Bin definitions (pbp_frac output = signed distance to nearest integer):
+*     bin 0: [-0.2, 0.2]    near integer
+*     bin 1: [-0.4,-0.2)    left mid-range
+*     bin 2: ( 0.2, 0.4]    right mid-range
+*     bin 3: (-inf,-0.4)    far left
+*     bin 4: ( 0.4,+inf)    far right
+*
+*   BDS count = entries already in ddamb[] (MEO sats failing arc-pairing excluded)
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 #include "ppp_ar_passbypass.h"
@@ -27,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <limits.h>
 
@@ -39,58 +35,34 @@ static double pbp_frac(double x)
     return r;
 }
 
-/* classify frac into 10 bins (refined near-integer sub-bins)
- *   bin 0: [ 0.0,  0.1]      near integer (positive)
- *   bin 1: ( 0.1,  0.15]     
- *   bin 2: ( 0.15, 0.2]      
- *   bin 3: [-0.1,  0.0)      near integer (negative)
- *   bin 4: [-0.15,-0.1)      
- *   bin 5: [-0.2, -0.15)     
- *   bin 6: [-0.4, -0.2)      left mid-range
- *   bin 7: ( 0.2,  0.4]      right mid-range
- *   bin 8: (-inf, -0.4)      far left
- *   bin 9: ( 0.4, +inf)      far right
- */
-#define NFRACBIN 10
+/* classify frac into bin 0-4 */
 static int frac_bin(double frac)
 {
-    if (frac >=  0.0  && frac <=  0.1 ) return 0;
-    if (frac >   0.1  && frac <=  0.15) return 1;
-    if (frac >   0.15 && frac <=  0.2 ) return 2;
-    if (frac >= -0.1  && frac <   0.0 ) return 3;
-    if (frac >= -0.15 && frac <  -0.1 ) return 4;
-    if (frac >= -0.2  && frac <  -0.15) return 5;
-    if (frac >= -0.4  && frac <  -0.2 ) return 6;
-    if (frac >   0.2  && frac <=  0.4 ) return 7;
-    if (frac <  -0.4)                    return 8;
-    return 9;
+    if (frac >= -0.2 && frac <=  0.2) return 0;
+    if (frac >= -0.4 && frac <  -0.2) return 1;
+    if (frac >   0.2 && frac <=  0.4) return 2;
+    if (frac <  -0.4)                  return 3;
+    return 4;
 }
 
-/* write one 10-bin percentage line */
+/* write one 5-bin percentage line */
 static void print_frac_bins(FILE *fp, const char *prefix,
-                             const int cnt[NFRACBIN], int total)
+                             const int cnt[5], int total)
 {
     if (!fp || total <= 0) return;
     double t = (double)total;
-    /* Group: near-integer = bins 0-5, mid-range = 6+7, far = 8+9 */
-    int near_int = cnt[0]+cnt[1]+cnt[2]+cnt[3]+cnt[4]+cnt[5];
     fprintf(fp,
-        "%s (n=%d):\n"
-        "%s   [0,0.1]=%.1f%%  (0.1,0.15]=%.1f%%  (0.15,0.2]=%.1f%%\n"
-        "%s   [-0.1,0)=%.1f%%  [-0.15,-0.1)=%.1f%%  [-0.2,-0.15)=%.1f%%\n"
-        "%s   [-0.4,-0.2)=%.1f%%  (0.2,0.4]=%.1f%%  <-0.4=%.1f%%  >0.4=%.1f%%\n"
-        "%s   near-int(|f|<=0.2)=%.1f%%\n",
-        prefix, total,
-        prefix, 100.0*cnt[0]/t, 100.0*cnt[1]/t, 100.0*cnt[2]/t,
-        prefix, 100.0*cnt[3]/t, 100.0*cnt[4]/t, 100.0*cnt[5]/t,
-        prefix, 100.0*cnt[6]/t, 100.0*cnt[7]/t, 100.0*cnt[8]/t, 100.0*cnt[9]/t,
-        prefix, 100.0*near_int/t);
+        "%s: [-0.2,0.2]=%5.1f%%  [-0.4,-0.2)=%5.1f%%  (0.2,0.4]=%5.1f%%"
+        "  <-0.4=%5.1f%%  >0.4=%5.1f%%  (n=%d)\n",
+        prefix,
+        100.0*cnt[0]/t, 100.0*cnt[1]/t, 100.0*cnt[2]/t,
+        100.0*cnt[3]/t, 100.0*cnt[4]/t, total);
 }
 
 /*------------------------------------------------------------------------------
 * pbp_write_dd_wlnl : write DD WL/NL table + extended statistics
 *
-*   [NEW §2] 10-bin fraction distribution for all/fixed, total + GPS + BDS
+*   [NEW §2] 5-bin fraction distribution for all/fixed, total + GPS + BDS
 *   [KEPT §1] Original |frac|<0.2 summary block unchanged
 *-----------------------------------------------------------------------------*/
 static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *tag)
@@ -101,10 +73,10 @@ static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *t
     int n_wl_all=0, n_wl_02=0, n_wl_fix=0, n_wl_fix_02=0;
     int n_nl_all=0, n_nl_02=0, n_nl_fix=0, n_nl_fix_02=0;
 
-    /* 10-bin counters: [sys_idx][subset][bin]
+    /* 5-bin counters: [sys_idx][subset][bin]
      *   sys_idx : 0=all  1=GPS  2=BDS
      *   subset  : 0=all independent DD  1=fixed only             */
-    int wl_bins[3][2][NFRACBIN], nl_bins[3][2][NFRACBIN];
+    int wl_bins[3][2][5], nl_bins[3][2][5];
     int wl_cnt[3][2],     nl_cnt[3][2];
     memset(wl_bins, 0, sizeof(wl_bins));
     memset(nl_bins, 0, sizeof(nl_bins));
@@ -182,7 +154,7 @@ static int pbp_write_dd_wlnl(FILE *fp, const ddamb_t *dd, int ndd, const char *t
         fprintf(fp, "# NL: fixed=%d, in0.2=%d (%.2f%%)\n",
                 n_nl_fix, n_nl_fix_02, 100.0*(double)n_nl_fix_02/(double)n_nl_fix);
 
-    /* ── §2  10-bin: all systems ────────────────────────────────────────── */
+    /* ── §2  5-bin: all systems ─────────────────────────────────────────── */
     fprintf(fp, "# --- Fraction bins (all independent DD) ---\n");
     print_frac_bins(fp, "# WL bins", wl_bins[0][0], wl_cnt[0][0]);
     print_frac_bins(fp, "# NL bins", nl_bins[0][0], nl_cnt[0][0]);
@@ -232,6 +204,224 @@ extern void pbp_clear_fixed_constraints(void);
 extern int  pbp_store_fixed_constraints(const ddamb_t *ddamb, int n_dd, double Pb);
 extern int  collect_ambiguities(const rtk_t *rtk, const obsd_t *obs, int n, int day, satamb_t *satamb);
 extern int pbp_bds_is_sidereal(int sat);
+
+/* ── Fixed DD IF day-2 sorted output ─────────────────────────────────────────
+ * This diagnostic writes ALL successfully fixed DD WL/NL constraints.  The
+ * previous epoch-expanded version required the day-1 reference arc and the
+ * day-1 target arc to overlap at the same epoch; that condition is too strict
+ * for pass-by-pass arc-level DD constraints and can make the output contain
+ * only one DD per system although many DDs were actually fixed.
+ *
+ * Here each fixed DD is written once and sorted by its second-day target arc
+ * start time.  Both the reference satellite and target satellite day-2 arc
+ * windows are printed, so the user can see where in day 2 this fixed DD comes
+ * from without discarding non-overlapping arc pairs.
+ *-----------------------------------------------------------------------------*/
+#ifndef PBP_SIDEREAL_SHIFT_SEC
+#define PBP_SIDEREAL_SHIFT_SEC 85920.0
+#endif
+
+typedef struct {
+    gtime_t key_time;
+    int sat1, sat2;
+    int arc1_d0, arc1_d1;
+    int arc2_d0, arc2_d1;
+    int fixed_wl, fixed_nl;
+    double dd_if, dd_if_fix;
+    double dd_wl, dd_wl_fix;
+    double dd_nl, dd_nl_fix;
+    double var_dd_if, var_dd_wl, var_dd_nl;
+} pbp_fixed_ddif_rec_t;
+
+static int pbp_time_is_valid(gtime_t t)
+{
+    return t.time != 0 || t.sec != 0.0;
+}
+
+static double pbp_overlap_sec(gtime_t a0, gtime_t a1, gtime_t b0, gtime_t b1)
+{
+    gtime_t s = timediff(a0,b0) >= 0.0 ? a0 : b0;
+    gtime_t e = timediff(a1,b1) <= 0.0 ? a1 : b1;
+    double dt = timediff(e,s);
+    return dt > 0.0 ? dt : 0.0;
+}
+
+static int pbp_find_day1_arc_from_day0(int sat, int arc0)
+{
+    if (sat <= 0 || sat > MAXSAT) return -1;
+    if (arc0 < 0 || arc0 >= satamb[sat-1].n) return -1;
+
+    const ambarc_t *a0 = &satamb[sat-1].arc[arc0];
+    if (a0->day != 0) return -1;
+
+    gtime_t sh_s = timeadd(a0->ts, PBP_SIDEREAL_SHIFT_SEC);
+    gtime_t sh_e = timeadd(a0->te, PBP_SIDEREAL_SHIFT_SEC);
+
+    int best = -1;
+    double best_ov = -1.0;
+    for (int i = 0; i < satamb[sat-1].n; i++) {
+        const ambarc_t *a1 = &satamb[sat-1].arc[i];
+        if (a1->day != 1 || a1->nobs < 10) continue;
+        double ov = pbp_overlap_sec(sh_s, sh_e, a1->ts, a1->te);
+        if (ov > best_ov) {
+            best_ov = ov;
+            best = i;
+        }
+    }
+    if (best >= 0 && best_ov > 0.0) return best;
+
+    /* Fallback: choose the closest day-1 arc by midpoint.  This is only for
+     * diagnostic output; the fixed DD itself has already been accepted by
+     * compute_dd_ambiguities() and fix_wl_nl_ambiguities(). */
+    double mid0 = time2gpst(sh_s, NULL) + 0.5 * timediff(sh_e, sh_s);
+    double best_abs = 1.0e100;
+    best = -1;
+    for (int i = 0; i < satamb[sat-1].n; i++) {
+        const ambarc_t *a1 = &satamb[sat-1].arc[i];
+        if (a1->day != 1 || a1->nobs < 10) continue;
+        double mid1 = time2gpst(a1->ts, NULL) + 0.5 * timediff(a1->te, a1->ts);
+        double d = fabs(mid1 - mid0);
+        if (d < best_abs) {
+            best_abs = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static int pbp_cmp_fixed_ddif_rec(const void *pa, const void *pb)
+{
+    const pbp_fixed_ddif_rec_t *a = (const pbp_fixed_ddif_rec_t *)pa;
+    const pbp_fixed_ddif_rec_t *b = (const pbp_fixed_ddif_rec_t *)pb;
+    double dt = timediff(a->key_time, b->key_time);
+    if (dt < -1E-9) return -1;
+    if (dt >  1E-9) return  1;
+    if (a->sat1 != b->sat1) return a->sat1 - b->sat1;
+    if (a->sat2 != b->sat2) return a->sat2 - b->sat2;
+    return a->arc2_d0 - b->arc2_d0;
+}
+
+static const char *pbp_sys_name_for_sat(int sat)
+{
+    int sys = satsys(sat, NULL);
+    if (sys == SYS_GPS) return "GPS";
+    if (sys == SYS_CMP) return "BDS";
+    if (sys == SYS_GLO) return "GLO";
+    if (sys == SYS_GAL) return "GAL";
+    if (sys == SYS_QZS) return "QZS";
+    return "UNK";
+}
+
+static void pbp_time_to_str_or_dash(gtime_t t, char *s, int n)
+{
+    if (!s || n <= 0) return;
+    if (!pbp_time_is_valid(t)) {
+        snprintf(s, n, "-");
+        return;
+    }
+    time2str(t, s, 1);
+}
+
+static int pbp_write_fixed_ddif_day2(const char *path, const ddamb_t *dd, int ndd)
+{
+    FILE *fp = NULL;
+    pbp_fixed_ddif_rec_t *rec = NULL;
+    int nrec = 0, nfixed = 0;
+    char cwd[PATH_MAX] = "";
+
+    if (!path || !*path || !dd || ndd <= 0) return 0;
+
+    rec = (pbp_fixed_ddif_rec_t *)calloc((size_t)ndd, sizeof(pbp_fixed_ddif_rec_t));
+    if (!rec) return 0;
+
+    for (int i = 0; i < ndd; i++) {
+        if (!dd[i].fixed_WL || !dd[i].fixed_NL) continue;
+        if (dd[i].sat1 <= 0 || dd[i].sat2 <= 0) continue;
+        nfixed++;
+
+        memset(&rec[nrec], 0, sizeof(rec[nrec]));
+        rec[nrec].sat1 = dd[i].sat1;
+        rec[nrec].sat2 = dd[i].sat2;
+        rec[nrec].arc1_d0 = dd[i].arc1;
+        rec[nrec].arc2_d0 = dd[i].arc2;
+        rec[nrec].arc1_d1 = pbp_find_day1_arc_from_day0(dd[i].sat1, dd[i].arc1);
+        rec[nrec].arc2_d1 = pbp_find_day1_arc_from_day0(dd[i].sat2, dd[i].arc2);
+        rec[nrec].fixed_wl = dd[i].fixed_WL ? 1 : 0;
+        rec[nrec].fixed_nl = dd[i].fixed_NL ? 1 : 0;
+        rec[nrec].dd_if = dd[i].DD_IF;
+        rec[nrec].dd_if_fix = dd[i].DD_IF_fix;
+        rec[nrec].dd_wl = dd[i].DD_WL;
+        rec[nrec].dd_wl_fix = dd[i].DD_WL_fix;
+        rec[nrec].dd_nl = dd[i].DD_NL;
+        rec[nrec].dd_nl_fix = dd[i].DD_NL_fix;
+        rec[nrec].var_dd_if = dd[i].var_DD_IF;
+        rec[nrec].var_dd_wl = dd[i].var_DD_WL;
+        rec[nrec].var_dd_nl = dd[i].var_DD_NL;
+
+        if (rec[nrec].arc2_d1 >= 0) {
+            rec[nrec].key_time = satamb[dd[i].sat2-1].arc[rec[nrec].arc2_d1].ts;
+        }
+        else if (rec[nrec].arc1_d1 >= 0) {
+            rec[nrec].key_time = satamb[dd[i].sat1-1].arc[rec[nrec].arc1_d1].ts;
+        }
+        else {
+            rec[nrec].key_time = (gtime_t){0};
+        }
+        nrec++;
+    }
+
+    qsort(rec, nrec, sizeof(rec[0]), pbp_cmp_fixed_ddif_rec);
+
+    fp = fopen(path, "w");
+    if (!fp) { free(rec); return 0; }
+    if (!getcwd(cwd, sizeof(cwd))) strncpy(cwd, ".", sizeof(cwd)-1);
+
+    fprintf(fp, "%% PBP fixed DD IF table sorted by day-2 arc time (GPST)\n");
+    fprintf(fp, "%% CWD: %s\n", cwd);
+    fprintf(fp, "%% IMPORTANT: all fixed DD constraints are written once; no epoch-overlap filter is applied.\n");
+    fprintf(fp, "%% DD_IF_FIX_M is the fixed DD IF pseudo-observation in metres; DD_WL_INT and DD_NL_INT are the fixed integers.\n");
+    fprintf(fp, "%% FIX_TIME_KEY REF_D2_START REF_D2_END SAT_D2_START SAT_D2_END SYS REF SAT ");
+    fprintf(fp, "ARC_REF_D0 ARC_REF_D1 ARC_SAT_D0 ARC_SAT_D1 DD_IF_FLOAT_M DD_IF_FIX_M DD_IF_RES_M DD_WL_FLOAT DD_WL_INT DD_NL_FLOAT DD_NL_INT SIG_DD_IF_M SIG_DD_WL_CYC SIG_DD_NL_CYC\n");
+
+    for (int i = 0; i < nrec; i++) {
+        char key[64], rts[64], rte[64], sts[64], ste[64];
+        char sref[16] = "", ssat[16] = "";
+        gtime_t rt0 = {0}, rt1 = {0}, st0 = {0}, st1 = {0};
+        if (rec[i].arc1_d1 >= 0) {
+            rt0 = satamb[rec[i].sat1-1].arc[rec[i].arc1_d1].ts;
+            rt1 = satamb[rec[i].sat1-1].arc[rec[i].arc1_d1].te;
+        }
+        if (rec[i].arc2_d1 >= 0) {
+            st0 = satamb[rec[i].sat2-1].arc[rec[i].arc2_d1].ts;
+            st1 = satamb[rec[i].sat2-1].arc[rec[i].arc2_d1].te;
+        }
+        pbp_time_to_str_or_dash(rec[i].key_time, key, sizeof(key));
+        pbp_time_to_str_or_dash(rt0, rts, sizeof(rts));
+        pbp_time_to_str_or_dash(rt1, rte, sizeof(rte));
+        pbp_time_to_str_or_dash(st0, sts, sizeof(sts));
+        pbp_time_to_str_or_dash(st1, ste, sizeof(ste));
+        satno2id(rec[i].sat1, sref);
+        satno2id(rec[i].sat2, ssat);
+
+        fprintf(fp,
+            "%s %s %s %s %s %3s %3s %3s %10d %10d %10d %10d "
+            "%14.6f %14.6f %12.6f %12.6f %10.0f %12.6f %10.0f %12.6f %12.6f %12.6f\n",
+            key, rts, rte, sts, ste,
+            pbp_sys_name_for_sat(rec[i].sat1), sref, ssat,
+            rec[i].arc1_d0, rec[i].arc1_d1, rec[i].arc2_d0, rec[i].arc2_d1,
+            rec[i].dd_if, rec[i].dd_if_fix, rec[i].dd_if_fix - rec[i].dd_if,
+            rec[i].dd_wl, rec[i].dd_wl_fix,
+            rec[i].dd_nl, rec[i].dd_nl_fix,
+            rec[i].var_dd_if > 0.0 ? sqrt(rec[i].var_dd_if) : 0.0,
+            rec[i].var_dd_wl > 0.0 ? sqrt(rec[i].var_dd_wl) : 0.0,
+            rec[i].var_dd_nl > 0.0 ? sqrt(rec[i].var_dd_nl) : 0.0);
+    }
+
+    fprintf(fp, "%% summary: input_dd=%d fixed_dd_seen=%d output_fixed_dd=%d\n", ndd, nfixed, nrec);
+    fclose(fp);
+    free(rec);
+    return nrec;
+}
 
 static int select_refsat_auto_sys(const satamb_t *sa, int sys)
 {
@@ -327,40 +517,6 @@ extern int ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs)
         fprintf(fpdd,"# PBP arc-level DD WL/NL (day0-day1)\n");
         fprintf(fpdd,"# CWD: %s\n",cwd);
         fprintf(fpdd,"# BDS = sats passing arc-pairing (non-1-day repeat excluded)\n");
-
-        /* ── Visible satellite counts ──────────────────────────────────── */
-        {
-            int n_gps_d0=0,n_gps_d1=0,n_gps_both=0;
-            int n_bds_d0=0,n_bds_d1=0,n_bds_both=0;
-            for (int i=0;i<MAXSAT;i++){
-                if (satamb[i].n<=0) continue;
-                int sat=i+1, sys=satsys(sat,NULL);
-                int has0=0,has1=0;
-                for (int j=0;j<satamb[i].n;j++){
-                    if (satamb[i].arc[j].nobs>=10){
-                        if (satamb[i].arc[j].day==0) has0=1;
-                        if (satamb[i].arc[j].day==1) has1=1;
-                    }
-                }
-                if (sys==SYS_GPS){
-                    if(has0) n_gps_d0++;
-                    if(has1) n_gps_d1++;
-                    if(has0&&has1) n_gps_both++;
-                } else if (sys==SYS_CMP){
-                    if(has0) n_bds_d0++;
-                    if(has1) n_bds_d1++;
-                    if(has0&&has1) n_bds_both++;
-                }
-            }
-            fprintf(fpdd,"# --- Visible satellites (nobs>=10) ---\n");
-            fprintf(fpdd,"# GPS: day0=%d  day1=%d  both=%d\n",n_gps_d0,n_gps_d1,n_gps_both);
-            fprintf(fpdd,"# BDS: day0=%d  day1=%d  both=%d\n",n_bds_d0,n_bds_d1,n_bds_both);
-            fprintf(fpdd,"# Total: day0=%d  day1=%d  both=%d\n",
-                    n_gps_d0+n_bds_d0,n_gps_d1+n_bds_d1,n_gps_both+n_bds_both);
-            printf("Visible sats: GPS(d0=%d d1=%d both=%d) BDS(d0=%d d1=%d both=%d)\n",
-                   n_gps_d0,n_gps_d1,n_gps_both,n_bds_d0,n_bds_d1,n_bds_both);
-        }
-
         fflush(fpdd);   /* ensure header is written even if program exits early */
     }
 
@@ -399,6 +555,17 @@ extern int ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs)
     {
         int n_ind=pbp_store_fixed_constraints(ddamb,n_ddamb,1.0e10);
         printf("Stored independent fixed DD constraints: %d\n",n_ind);
+    }
+
+    {
+        char ddifpath[PATH_MAX] = "pbp_fixed_ddif_day2.txt";
+        int nw = pbp_write_fixed_ddif_day2(ddifpath, ddamb, n_ddamb);
+        if (nw > 0) {
+            printf("PBP fixed DD IF day2 sorted table written: %s  (rows=%d)\n", ddifpath, nw);
+        }
+        else {
+            printf("[PBP] Warning: no fixed DD IF row written to %s\n", ddifpath);
+        }
     }
 
     if (fpdd) { fclose(fpdd); printf("PBP DD WL/NL written: %s\n",ddpath); }
