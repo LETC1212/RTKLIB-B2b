@@ -2163,16 +2163,7 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
                                         stat = -1;
                                     }
                                     /* Write diagnostic CSV alongside */
-                                    {
-                                        extern int pbp_write_diag_csv(const char *path);
-                                        extern int pbp_write_day1_neqfloat_clock_file(const char *path);
-                                        char diagfile[1024], floatfile[1024];
-                                        snprintf(diagfile,sizeof(diagfile),"%s.pbp_neq_diag.csv",tmp);
-                                        pbp_write_diag_csv(diagfile);
-                                        snprintf(floatfile,sizeof(floatfile),"%s.pbp_floatclk",tmp);
-                                        if (!pbp_write_day1_neqfloat_clock_file(floatfile))
-                                            printf("[PBP] WARNING: failed to write NEQ float clock: %s\n",floatfile);
-                                    }
+
                                 }
                                 else {
                                     printf("[PBP] ERROR: invalid output file path for fixed clock file.\n");
