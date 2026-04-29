@@ -107,8 +107,8 @@ extern int  pbp_bds_is_sidereal(int sat);
 extern int  pbp_neq_init(gtime_t t0, gtime_t t1, double ti,
                            const prcopt_t *opt);
 extern int  pbp_neq_add_epoch(rtk_t *rtk, const obsd_t *obs, int n,
-                                const double *v, const double *H,
-                                const double *R, int nv);
+                              const double *v, const double *H,
+                              const double *R, int nv);
 extern int  pbp_build_arc_columns(void);
 extern int  pbp_store_fixed_constraints(const ddamb_t *dd, int n_dd,
                                          double Pb);
@@ -129,6 +129,7 @@ extern int  apply_ar_fixed(rtk_t *rtk, const ddamb_t *ddamb, int n_dd);
 
 /* Diagnostics */
 extern void pbp_print_epoch_stats(void);
+extern int  pbp_write_day1_neqfloat_clock_file(const char *path);
 
 /* ── Functions: ppp_ar_integration.c ───────────────────────────────────── */
 extern int  ppp_ar_48h(const prcopt_t *popt, rtk_t *rtk, const obs_t *obs);
