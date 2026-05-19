@@ -15,6 +15,8 @@ set(B2bLIB_SOURCES
     postpos.c
     ppp.c
     ppp_ar.c
+    ppp_ar_passbypass.c
+    ppp_ar_integration.c
     preceph.c
     rcvraw.c
     rinex.c
@@ -67,28 +69,20 @@ set(B2bLIB_SOURCES
     f2c/zero_vec8.c
 )
 
-
-# 生成一个静态库供子项目使用
 add_library(B2bLib STATIC ${B2bLIB_SOURCES})
 
-# 链接数学库、线程库 (BLAS 和 LAPACK 未在嵌入式环境下验证是否可以安装，因此跳过使用)
 target_link_libraries(B2bLib PUBLIC m)
 
-# 根据操作系统链接线程库
 if(UNIX)
-    # Linux 或其他 POSIX 系统使用 pthread
     target_link_libraries(B2bLib PUBLIC pthread)
 elseif(WIN32)
-    # Windows 下 MinGW 使用 -mthreads
     target_compile_options(B2bLib PUBLIC -mthreads)
     target_link_libraries(B2bLib PUBLIC ws2_32 winmm)
     message(STATUS "MinGW library path: ${CMAKE_C_IMPLICIT_LINK_DIRECTORIES}")
 endif()
 
-# 指定头文件路径
 target_include_directories(B2bLib PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
-# 处理定义
 target_compile_definitions(B2bLib PUBLIC
     ENAGLO
     ENAGAL
